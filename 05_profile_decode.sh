@@ -9,7 +9,7 @@ ensure_workflow_dirs
 
 # The decode profile reuses an Nsight Systems trace so we can target a middle
 # generation-only step instead of startup or drain.
-bash "$WORKFLOW_ROOT/07_nsys_decode.sh"
+bash "$WORKFLOW_ROOT/nsys_decode.sh"
 
 decode_ncu_stem="$REPORTS_DIR/decode"
 decode_ncu_report="$REPORTS_DIR/decode.ncu-rep"

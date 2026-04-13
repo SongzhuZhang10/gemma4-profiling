@@ -15,7 +15,7 @@
   - `tensorrt_llm` is **not** installed there yet
 
 ## Implementation Changes
-- Create the required scripts `01_install.sh` through `08_report_run_config.sh`, plus one shared Python helper module and one shared shell env file.
+- Create the required scripts `01_install.sh` through `06_report_run_config.sh`, plus two internal helper scripts (`nsys_prefill.sh`, `nsys_decode.sh`), one shared Python helper module and one shared shell env file.
 - Hard-code the Python entrypoints in every script to use:
   - `PYTHON_BIN=/home/songzhu/Desktop/dl_env/bin/python`
   - `PIP_BIN=/home/songzhu/Desktop/dl_env/bin/pip`
@@ -28,7 +28,7 @@
 - `03_build_or_prepare_runtime.sh` should prepare and warm the runtime using `/home/songzhu/Desktop/dl_env/bin/python`, and persist any compile/cache artifacts under `artifacts/cache/`.
 
 - Profiling scripts
-  - `04_profile_prefill.sh`, `05_profile_decode.sh`, `06_nsys_prefill.sh`, and `07_nsys_decode.sh` should launch the profiled application via `/home/songzhu/Desktop/dl_env/bin/python`.
+  - `04_profile_prefill.sh` and `05_profile_decode.sh` should launch the profiled application via `/home/songzhu/Desktop/dl_env/bin/python`. Each internally calls `nsys_prefill.sh` or `nsys_decode.sh` respectively (not intended to be run directly by users).
   - Use TensorRT-LLM executor NVTX ranges to identify:
     - prefill: `_forward_step` with `ctx reqs > 0`
     - decode: `_forward_step` with `ctx reqs = 0` and `gen reqs > 0`
@@ -36,7 +36,7 @@
   - Save the selected phase ordinals and report paths into `artifacts/run_config.json`.
 
 - Reporting
-  - `08_report_run_config.sh` prints and saves:
+  - `06_report_run_config.sh` prints and saves:
     - requested model id
     - actual profiled model id
     - TensorRT-LLM version from `/home/songzhu/Desktop/dl_env`

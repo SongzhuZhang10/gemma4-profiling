@@ -9,7 +9,7 @@ ensure_workflow_dirs
 
 # Nsight Systems validates the phase marker first so the workflow confirms a
 # real prefill step before Nsight Compute runs.
-bash "$WORKFLOW_ROOT/06_nsys_prefill.sh"
+bash "$WORKFLOW_ROOT/nsys_prefill.sh"
 
 prefill_ncu_stem="$REPORTS_DIR/prefill"
 prefill_ncu_report="$REPORTS_DIR/prefill.ncu-rep"
