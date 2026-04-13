@@ -804,6 +804,8 @@ def run_inference_command(args: argparse.Namespace) -> int:
     prompt_text = prompt_path.read_text()
     max_new_tokens = args.max_new_tokens or runtime["max_new_tokens"]
 
+    nvtx_tag = getattr(args, "nvtx_tag", None)
+
     started = time.time()
     with AutoDeployLLM(
         model=runtime["actual_model_id"],
@@ -812,11 +814,16 @@ def run_inference_command(args: argparse.Namespace) -> int:
         yaml_extra=[runtime["yaml_path"]],
         trust_remote_code=True,
     ) as llm:
+        if nvtx_tag:
+            import torch.cuda.nvtx as cuda_nvtx
+            cuda_nvtx.range_push(nvtx_tag)
         result = llm.generate(
             prompt_text,
             sampling_params=SamplingParams(max_tokens=max_new_tokens),
             use_tqdm=False,
         )
+        if nvtx_tag:
+            cuda_nvtx.range_pop()
         metadata = extract_output_metadata(result)
 
     metadata.update(
@@ -854,10 +861,14 @@ def export_nsys_sqlite(report_path: Path) -> Path:
             str(report_path),
         ]
     )
+    # Newer nsys versions (2024.6+) write to the exact --output path without
+    # appending .sqlite, while older versions append .sqlite automatically.
     sqlite_path = sqlite_prefix.with_suffix(".sqlite")
-    if not sqlite_path.exists():
-        fail(f"Expected exported SQLite report was not created at {sqlite_path}")
-    return sqlite_path
+    if sqlite_path.exists():
+        return sqlite_path
+    if sqlite_prefix.exists() and sqlite_prefix.suffix != ".sqlite":
+        return sqlite_prefix
+    fail(f"Expected exported SQLite report was not created at {sqlite_path} or {sqlite_prefix}")
 
 
 def parse_forward_steps(sqlite_path: Path) -> List[StepRecord]:
@@ -1081,6 +1092,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Optional JSON path for inference metadata.",
+    )
+    run_inference.add_argument(
+        "--nvtx-tag",
+        type=str,
+        default=None,
+        help="Wrap llm.generate() in an NVTX push/pop range with this name for ncu filtering.",
     )
 
     summarize_nsys = subparsers.add_parser(
