@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+
+# Shared environment for the Gemma 4 WSL2 profiling workflow.
+# This file is sourced by the numbered entrypoint scripts.
+
+set -euo pipefail
+
+readonly WORKFLOW_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly PYTHON_BIN="/home/songzhu/Desktop/dl_env/bin/python"
+readonly PIP_BIN="/home/songzhu/Desktop/dl_env/bin/pip"
+readonly DL_ENV_ROOT="/home/songzhu/Desktop/dl_env"
+
+readonly ARTIFACTS_DIR="$WORKFLOW_ROOT/artifacts"
+readonly CACHE_DIR="$ARTIFACTS_DIR/cache"
+readonly RUNTIME_DIR="$ARTIFACTS_DIR/runtime"
+readonly REPORTS_DIR="$ARTIFACTS_DIR/reports"
+readonly RUN_CONFIG_JSON="$ARTIFACTS_DIR/run_config.json"
+
+# Keep all Python-side caches inside the repo-local artifacts tree so the run is
+# reproducible and we avoid depending on per-user global cache locations.
+export HF_HOME="${HF_HOME:-$CACHE_DIR/hf}"
+export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$CACHE_DIR/hf/hub}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$CACHE_DIR/hf/transformers}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$CACHE_DIR/xdg}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$CACHE_DIR/torchinductor}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$CACHE_DIR/triton}"
+export TLLM_LLMAPI_BUILD_CACHE=1
+export TLLM_LLMAPI_BUILD_CACHE_ROOT="${TLLM_LLMAPI_BUILD_CACHE_ROOT:-$CACHE_DIR/tllm_build_cache}"
+
+# WSL2 CUDA user-space tools are often installed under one of these prefixes,
+# but they are not always exported into PATH by default shell startup files.
+for cuda_bin_dir in /usr/local/cuda/bin /usr/local/cuda-12.8/bin; do
+  if [[ -d "$cuda_bin_dir" && ":$PATH:" != *":$cuda_bin_dir:"* ]]; then
+    export PATH="$cuda_bin_dir:$PATH"
+  fi
+done
+
+# TensorRT-LLM in this workflow relies on native libraries installed into the
+# shared dl_env prefix. Export these paths centrally so every numbered script
+# inherits the same runtime view after 01_install.sh provisions them.
+if [[ -x "$PYTHON_BIN" ]]; then
+  PYTHON_SITE_PACKAGES="$("$PYTHON_BIN" - <<'PY'
+import sysconfig
+print(sysconfig.get_paths()["purelib"])
+PY
+)"
+else
+  PYTHON_SITE_PACKAGES="$DL_ENV_ROOT/lib/python3.10/site-packages"
+fi
+
+if [[ -d "$DL_ENV_ROOT/share/openmpi" ]]; then
+  export OPAL_PREFIX="${OPAL_PREFIX:-$DL_ENV_ROOT}"
+fi
+
+for native_dir in \
+  "$DL_ENV_ROOT/bin" \
+  "$DL_ENV_ROOT/lib" \
+  "$DL_ENV_ROOT/lib/openmpi" \
+  "$PYTHON_SITE_PACKAGES/nvidia/cu13/lib" \
+  "$PYTHON_SITE_PACKAGES/nvidia/nccl/lib" \
+  "$PYTHON_SITE_PACKAGES/tensorrt_libs"; do
+  if [[ -d "$native_dir" ]]; then
+    if [[ "$native_dir" == *"/bin" ]]; then
+      if [[ ":$PATH:" != *":$native_dir:"* ]]; then
+        export PATH="$native_dir:$PATH"
+      fi
+    else
+      if [[ ":${LD_LIBRARY_PATH:-}:" != *":$native_dir:"* ]]; then
+        export LD_LIBRARY_PATH="$native_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+      fi
+    fi
+  fi
+done
+
+export PYTHONPATH="$WORKFLOW_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
+function workflow_log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+function require_python_env() {
+  if [[ ! -x "$PYTHON_BIN" ]]; then
+    workflow_log "Expected Python interpreter not found at $PYTHON_BIN"
+    exit 1
+  fi
+
+  if [[ ! -x "$PIP_BIN" ]]; then
+    workflow_log "Expected pip executable not found at $PIP_BIN"
+    exit 1
+  fi
+}
+
+function ensure_workflow_dirs() {
+  mkdir -p "$ARTIFACTS_DIR" "$CACHE_DIR" "$RUNTIME_DIR" "$REPORTS_DIR"
+  mkdir -p "$HF_HOME" "$HUGGINGFACE_HUB_CACHE" "$TRANSFORMERS_CACHE"
+  mkdir -p "$XDG_CACHE_HOME" "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
+  mkdir -p "$TLLM_LLMAPI_BUILD_CACHE_ROOT"
+}
