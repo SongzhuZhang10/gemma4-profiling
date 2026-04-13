@@ -817,11 +817,13 @@ def run_inference_command(args: argparse.Namespace) -> int:
         if nvtx_tag:
             import torch.cuda.nvtx as cuda_nvtx
             cuda_nvtx.range_push(nvtx_tag)
+
         result = llm.generate(
             prompt_text,
             sampling_params=SamplingParams(max_tokens=max_new_tokens),
             use_tqdm=False,
         )
+
         if nvtx_tag:
             cuda_nvtx.range_pop()
         metadata = extract_output_metadata(result)
@@ -923,7 +925,14 @@ def choose_phase_step(steps: Sequence[StepRecord], phase: str) -> StepRecord:
 
 
 def nvtx_filter_for_text(step_text: str) -> str:
-    return f"regex:{re.escape(step_text)}/"
+    # Nsight Compute expects start/end range names to be passed literally, but
+    # filter-quantifier characters in the range text itself must be escaped.
+    # TensorRT-LLM emits labels like "[Executor] _forward_step ... , ..." which
+    # otherwise get misparsed as push/pop syntax or range delimiters.
+    escaped = step_text.replace("\\", "\\\\")
+    for char in ("@", ",", "[", "]", "/", "*", "+"):
+        escaped = escaped.replace(char, f"\\{char}")
+    return escaped
 
 
 def summarize_nsys_command(args: argparse.Namespace) -> int:
@@ -977,11 +986,22 @@ def summarize_nsys_command(args: argparse.Namespace) -> int:
 def nvtx_filter_command(args: argparse.Namespace) -> int:
     config = load_run_config()
     phase_profile = config.get("profiles", {}).get(args.phase)
-    if not phase_profile or not phase_profile.get("selected_nvtx_include_filter"):
+    if not phase_profile:
         fail(
             f"No NVTX filter is recorded for phase '{args.phase}'. Run the corresponding Nsight Systems script first."
         )
-    print(phase_profile["selected_nvtx_include_filter"])
+
+    selected_step_text = phase_profile.get("selected_step_text")
+    if selected_step_text:
+        print(nvtx_filter_for_text(selected_step_text))
+        return 0
+
+    stored_filter = phase_profile.get("selected_nvtx_include_filter")
+    if not stored_filter:
+        fail(
+            f"No NVTX filter is recorded for phase '{args.phase}'. Run the corresponding Nsight Systems script first."
+        )
+    print(stored_filter)
     return 0
 
 
@@ -1099,7 +1119,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Wrap llm.generate() in an NVTX push/pop range with this name for ncu filtering.",
     )
-
     summarize_nsys = subparsers.add_parser(
         "summarize-nsys",
         help="Export a .nsys-rep file to SQLite and derive the target NVTX phase marker.",
