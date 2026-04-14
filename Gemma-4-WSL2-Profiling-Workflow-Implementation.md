@@ -213,35 +213,6 @@ artifacts/
 
 ---
 
-# Limitation of the current progress
-
-The two scripts, `04_profile_prefill.sh` and `05_profile_decode.sh`, collect the same four Nsight Compute metrics for both prefill and decode:
-
-- `gpu__time_duration.sum`: kernel execution time
-- `sm__throughput.avg.pct_of_peak_sustained_elapsed`: SM compute utilization as a percent of peak
-- `gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed`: DRAM bandwidth utilization as a percent of peak
-- `sm__warps_active.avg.pct_of_peak_sustained_active`: warp activity / occupancy-style utilization
-
-You can see that metric list in [04_profile_prefill.sh](/home/songzhu/Desktop/ece-511/04_profile_prefill.sh:181) and [05_profile_decode.sh](/home/songzhu/Desktop/ece-511/05_profile_decode.sh:95). Both scripts also use `--launch-count 1`, so they are intentionally profiling just a single matched kernel result rather than a broad sample.
-
-These metrics are enough for a coarse first-pass bottleneck diagnosis, such as:
-- whether a kernel is more compute-bound or memory-bandwidth-bound
-- whether GPU utilization looks low because of poor occupancy / limited warp activity
-- whether prefill and decode differ in basic GPU saturation
-
-The collected data are not enough by themselves for strong research on performance bottleneck identification. The main gaps are:
-- no stall reasons or scheduler breakdowns
-- no cache metrics like L1/L2 hit rates
-- no tensor core / instruction mix information
-- no PCIe / host-device transfer analysis
-- no CPU-side or end-to-end timeline data from these scripts themselves
-- only one kernel sample per run, which risks being unrepresentative
-
-The collected data are useful for exploratory profiling, but not sufficient alone for rigorous bottleneck-identification research. For research-quality results, you’d usually want these counters plus broader Nsight Systems timeline data, more detailed NCU sections, multiple kernels per phase, repeated runs, and workload variation.
-
-
----
-
 ## 4. Problems Encountered and Solutions
 
 | # | Problem | Root Cause | Solution | Affected File(s) |
