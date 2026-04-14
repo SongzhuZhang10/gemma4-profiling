@@ -4,8 +4,129 @@ set -euo pipefail
 
 source "$(cd "$(dirname "$0")" && pwd)/workflow_env.sh"
 
+function env_has_required_binaries() {
+  [[ -x "$DL_ENV_ROOT/bin/python" && -x "$DL_ENV_ROOT/bin/pip" ]]
+}
+
+function env_is_usable() {
+  if ! env_has_required_binaries; then
+    return 1
+  fi
+
+  python_env_is_python310 "$DL_ENV_ROOT/bin/python"
+}
+
+function ensure_selected_python_env() {
+  if [[ "$DL_ENV_ROOT" == "$LEGACY_DL_ENV_ROOT" ]]; then
+    if ! env_has_required_binaries; then
+      workflow_log "Legacy Python environment detected at $DL_ENV_ROOT, but bin/python or bin/pip is missing."
+      workflow_log "Please repair or remove that directory so the workflow can create and use $FALLBACK_DL_ENV_ROOT instead."
+      exit 1
+    fi
+
+    if ! env_is_usable; then
+      workflow_log "Legacy Python environment at $DL_ENV_ROOT is not a usable Python 3.10 virtual environment."
+      workflow_log "Please repair or remove that directory so the workflow can create and use $FALLBACK_DL_ENV_ROOT instead."
+      exit 1
+    fi
+
+    workflow_log "Using existing legacy Python environment at $DL_ENV_ROOT."
+    return 0
+  fi
+
+  if env_is_usable; then
+    workflow_log "Using existing portable Python environment at $DL_ENV_ROOT."
+    return 0
+  fi
+
+  if ! command -v python3.10 >/dev/null 2>&1; then
+    workflow_log "python3.10 was not found in PATH."
+    workflow_log "Install Python 3.10 on this machine first, then rerun 01_install.sh."
+    exit 1
+  fi
+
+  if ! python_env_is_python310 "$(command -v python3.10)"; then
+    workflow_log "The python3.10 command does not report Python 3.10 as expected."
+    exit 1
+  fi
+
+  workflow_log "Creating or repairing the portable Python 3.10 virtual environment at $DL_ENV_ROOT."
+  mkdir -p "$(dirname "$DL_ENV_ROOT")"
+  python3.10 -m venv "$DL_ENV_ROOT"
+
+  if ! env_is_usable; then
+    workflow_log "Python 3.10 virtual environment creation completed, but $DL_ENV_ROOT is still not usable."
+    exit 1
+  fi
+}
+
+function ensure_vscode_settings() {
+  local interpreter_path="$PYTHON_BIN"
+
+  if [[ "$DL_ENV_ROOT" == "$FALLBACK_DL_ENV_ROOT" ]]; then
+    interpreter_path='${workspaceFolder}/.venv/bin/python'
+  fi
+
+  mkdir -p "$WORKFLOW_ROOT/.vscode"
+
+  VSCODE_SETTINGS_PATH="$WORKFLOW_ROOT/.vscode/settings.json" \
+  VSCODE_INTERPRETER_PATH="$interpreter_path" \
+  "$PYTHON_BIN" - <<'PY'
+from pathlib import Path
+import json
+import os
+import sys
+
+settings_path = Path(os.environ["VSCODE_SETTINGS_PATH"])
+interpreter_path = os.environ["VSCODE_INTERPRETER_PATH"]
+
+if settings_path.exists():
+    try:
+        settings = json.loads(settings_path.read_text())
+    except json.JSONDecodeError as exc:
+        print(f"{settings_path} is not valid JSON: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+else:
+    settings = {}
+
+if not isinstance(settings, dict):
+    print(f"{settings_path} must contain a JSON object.", file=sys.stderr)
+    raise SystemExit(1)
+
+settings["python.defaultInterpreterPath"] = interpreter_path
+settings_path.write_text(json.dumps(settings, indent=4) + "\n")
+PY
+
+  workflow_log "Updated VS Code interpreter setting at $WORKFLOW_ROOT/.vscode/settings.json."
+}
+
+function ensure_pinned_python_stack() {
+  workflow_log "Installing or updating packaging tools inside $DL_ENV_ROOT."
+  "$PIP_BIN" install --upgrade pip 'setuptools<80' wheel
+
+  workflow_log "Installing pinned PyTorch packages for CUDA 12.8 inside $DL_ENV_ROOT."
+  "$PIP_BIN" install --upgrade \
+    --index-url https://download.pytorch.org/whl/cu128 \
+    --extra-index-url https://pypi.org/simple \
+    torch==2.9.1+cu128 \
+    torchvision==0.24.1+cu128
+
+  workflow_log "Installing pinned workflow packages inside $DL_ENV_ROOT."
+  "$PIP_BIN" install --upgrade \
+    tensorrt-llm==1.2.0 \
+    transformers==4.57.3 \
+    PyYAML==6.0.3 \
+    sentencepiece==0.2.1 \
+    Pillow==12.1.1 \
+    accelerate==1.13.0 \
+    huggingface_hub==0.36.2
+}
+
+ensure_selected_python_env
 require_python_env
 ensure_workflow_dirs
+ensure_vscode_settings
+ensure_pinned_python_stack
 
 site_packages_dir="$("$PYTHON_BIN" - <<'PY'
 import sysconfig
@@ -43,7 +164,7 @@ function ensure_openmpi_runtime() {
     return 0
   fi
 
-  workflow_log "Installing user-space OpenMPI runtime into /home/songzhu/Desktop/dl_env."
+  workflow_log "Installing user-space OpenMPI runtime into $DL_ENV_ROOT."
   "$PIP_BIN" install --upgrade openmpi==4.1.8
   refresh_native_runtime_env
 
@@ -59,7 +180,7 @@ function ensure_cuda13_cublas_runtime() {
     return 0
   fi
 
-  workflow_log "Installing CUDA 13 CUBLAS runtime into /home/songzhu/Desktop/dl_env."
+  workflow_log "Installing CUDA 13 CUBLAS runtime into $DL_ENV_ROOT."
   "$PIP_BIN" install --upgrade nvidia-cublas==13.3.0.5
   refresh_native_runtime_env
 
@@ -112,7 +233,7 @@ function ensure_tensorrt_llm_importable() {
 
   cat "$import_error_log" >&2
   rm -f "$import_error_log"
-  workflow_log "TensorRT-LLM is installed but not importable in /home/songzhu/Desktop/dl_env."
+  workflow_log "TensorRT-LLM is installed but not importable in $DL_ENV_ROOT."
   exit 1
 }
 
@@ -190,31 +311,7 @@ nvidia-smi --query-gpu=name,memory.total,driver_version,compute_cap --format=csv
 ncu --version
 nsys --version
 
-workflow_log "Checking Python dependencies inside /home/songzhu/Desktop/dl_env."
-
-missing_python_deps="$("$PYTHON_BIN" - <<'PY'
-import importlib.util
-
-module_to_package = {
-    "tensorrt_llm": "tensorrt_llm",
-    "yaml": "PyYAML",
-    "sentencepiece": "sentencepiece",
-    "PIL": "Pillow",
-    "accelerate": "accelerate",
-    "huggingface_hub": "huggingface_hub",
-}
-
-missing = [package for module, package in module_to_package.items() if importlib.util.find_spec(module) is None]
-print(" ".join(missing))
-PY
-)"
-
-if [[ -n "$missing_python_deps" ]]; then
-  workflow_log "Installing missing Python packages into /home/songzhu/Desktop/dl_env: $missing_python_deps"
-  "$PIP_BIN" install --upgrade $missing_python_deps
-else
-  workflow_log "Required Python packages are already present in /home/songzhu/Desktop/dl_env."
-fi
+workflow_log "Verified the pinned Python dependency set inside $DL_ENV_ROOT."
 
 # TensorRT-LLM ships native bindings that require OpenMPI at runtime even after pip install succeeds.
 ensure_tensorrt_llm_importable

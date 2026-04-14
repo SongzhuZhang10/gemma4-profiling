@@ -6,9 +6,17 @@
 set -euo pipefail
 
 readonly WORKFLOW_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly PYTHON_BIN="/home/songzhu/Desktop/dl_env/bin/python"
-readonly PIP_BIN="/home/songzhu/Desktop/dl_env/bin/pip"
-readonly DL_ENV_ROOT="/home/songzhu/Desktop/dl_env"
+readonly LEGACY_DL_ENV_ROOT="/home/songzhu/Desktop/dl_env"
+readonly FALLBACK_DL_ENV_ROOT="$WORKFLOW_ROOT/.venv"
+
+if [[ -d "$LEGACY_DL_ENV_ROOT" ]]; then
+  readonly DL_ENV_ROOT="$LEGACY_DL_ENV_ROOT"
+else
+  readonly DL_ENV_ROOT="$FALLBACK_DL_ENV_ROOT"
+fi
+
+readonly PYTHON_BIN="$DL_ENV_ROOT/bin/python"
+readonly PIP_BIN="$DL_ENV_ROOT/bin/pip"
 
 readonly ARTIFACTS_DIR="$WORKFLOW_ROOT/artifacts"
 readonly CACHE_DIR="$ARTIFACTS_DIR/cache"
@@ -20,12 +28,18 @@ readonly RUN_CONFIG_JSON="$ARTIFACTS_DIR/run_config.json"
 # reproducible and we avoid depending on per-user global cache locations.
 export HF_HOME="${HF_HOME:-$CACHE_DIR/hf}"
 export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$CACHE_DIR/hf/hub}"
-export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$CACHE_DIR/hf/transformers}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$CACHE_DIR/xdg}"
 export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$CACHE_DIR/torchinductor}"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$CACHE_DIR/triton}"
 export TLLM_LLMAPI_BUILD_CACHE=1
 export TLLM_LLMAPI_BUILD_CACHE_ROOT="${TLLM_LLMAPI_BUILD_CACHE_ROOT:-$CACHE_DIR/tllm_build_cache}"
+
+# Suppress modelopt.torch's UserWarning about transformers >= 4.57.
+# TRT-LLM 1.2.0 pins transformers==4.57.3 and nvidia-modelopt~=0.37.0, but
+# modelopt 0.37.0 only accepts transformers < 4.57. The two constraints are
+# irreconcilable within TRT-LLM 1.2.0; the warning is noise, not an actionable
+# error for this workflow.
+export PYTHONWARNINGS="${PYTHONWARNINGS:+${PYTHONWARNINGS},}ignore::UserWarning:modelopt.torch"
 
 # WSL2 CUDA user-space tools are often installed under one of these prefixes,
 # but they are not always exported into PATH by default shell startup files.
@@ -78,6 +92,16 @@ function workflow_log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
 }
 
+function python_env_is_python310() {
+  local python_bin="${1:-$PYTHON_BIN}"
+
+  "$python_bin" - <<'PY' >/dev/null 2>&1
+import sys
+
+raise SystemExit(0 if sys.version_info[:2] == (3, 10) else 1)
+PY
+}
+
 function require_python_env() {
   if [[ ! -x "$PYTHON_BIN" ]]; then
     workflow_log "Expected Python interpreter not found at $PYTHON_BIN"
@@ -88,11 +112,16 @@ function require_python_env() {
     workflow_log "Expected pip executable not found at $PIP_BIN"
     exit 1
   fi
+
+  if ! python_env_is_python310 "$PYTHON_BIN"; then
+    workflow_log "Expected Python 3.10 interpreter at $PYTHON_BIN"
+    exit 1
+  fi
 }
 
 function ensure_workflow_dirs() {
   mkdir -p "$ARTIFACTS_DIR" "$CACHE_DIR" "$RUNTIME_DIR" "$REPORTS_DIR"
-  mkdir -p "$HF_HOME" "$HUGGINGFACE_HUB_CACHE" "$TRANSFORMERS_CACHE"
+  mkdir -p "$HF_HOME" "$HUGGINGFACE_HUB_CACHE"
   mkdir -p "$XDG_CACHE_HOME" "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
   mkdir -p "$TLLM_LLMAPI_BUILD_CACHE_ROOT"
 }

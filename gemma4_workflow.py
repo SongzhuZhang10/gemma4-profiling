@@ -1,4 +1,4 @@
-#!/home/songzhu/Desktop/dl_env/bin/python
+#!/usr/bin/env python3
 """Helper entrypoints for the Gemma 4 WSL2 profiling workflow."""
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -52,15 +53,46 @@ MODEL_CANDIDATES: List[Dict[str, Any]] = [
     },
 ]
 
-PRECISION_ORDER = ["FP16", "FP32", "BF16", "INT8"]
+PRECISION_ORDER = ["FP16", "BF16"]
+DISABLED_PRECISIONS = {"FP32", "INT8"}
 PRECISION_TO_DTYPE = {
     "FP16": "float16",
     "FP32": "float32",
     "BF16": "bfloat16",
 }
 
+
+def sanitize_precision_order(precision_order: Optional[Iterable[str]]) -> List[str]:
+    requested_order = list(precision_order) if precision_order is not None else list(PRECISION_ORDER)
+    sanitized: List[str] = []
+
+    for precision in requested_order:
+        if precision in DISABLED_PRECISIONS or precision not in PRECISION_TO_DTYPE:
+            continue
+        if precision not in sanitized:
+            sanitized.append(precision)
+
+    return sanitized or list(PRECISION_ORDER)
+
 FORWARD_STEP_PATTERN = re.compile(
     r"_forward_step\s+(\d+):\s+(\d+)\s+ctx reqs,\s+(\d+)\s+gen reqs"
+)
+
+GEMM_KERNEL_TOKENS = ("gemm", "gemv", "xmma", "mma", "cublas", "cutlass")
+ATTENTION_KERNEL_TOKENS = ("attention", "flash")
+GATHER_KERNEL_TOKENS = ("gather", "scatter")
+SAMPLING_KERNEL_TOKENS = (
+    "distribution_elementwise_grid_stride_kernel",
+    "distribution_nullary_kernel",
+    "philox",
+    "curand",
+    "normal_kernel",
+)
+COPY_KERNEL_TOKENS = (
+    "vectorized_elementwise_kernel",
+    "copy_kernel",
+    "copy_kernel_cuda",
+    "bfloat16_copy_kernel_cuda",
 )
 
 
@@ -113,11 +145,6 @@ def ensure_dirs() -> None:
                 "HUGGINGFACE_HUB_CACHE", str(CACHE_DIR / "hf" / "hub")
             )
         ),
-        Path(
-            os.environ.setdefault(
-                "TRANSFORMERS_CACHE", str(CACHE_DIR / "hf" / "transformers")
-            )
-        ),
         Path(os.environ.setdefault("XDG_CACHE_HOME", str(CACHE_DIR / "xdg"))),
         Path(
             os.environ.setdefault(
@@ -163,6 +190,589 @@ def write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
+def metric_value_to_ns(value: str, unit: str) -> Optional[int]:
+    try:
+        numeric_value = float((value or "").replace(",", ""))
+    except ValueError:
+        return None
+
+    scale = {
+        "": 1.0,
+        "ns": 1.0,
+        "us": 1_000.0,
+        "ms": 1_000_000.0,
+        "s": 1_000_000_000.0,
+    }.get((unit or "").strip().lower())
+    if scale is None:
+        return None
+    return int(numeric_value * scale)
+
+
+def classify_kernel_family(kernel_name: str) -> str:
+    lowered = kernel_name.lower()
+    if any(token in lowered for token in SAMPLING_KERNEL_TOKENS):
+        return "sampling_like"
+    if any(token in lowered for token in COPY_KERNEL_TOKENS):
+        return "copy_like"
+    if any(token in lowered for token in GEMM_KERNEL_TOKENS):
+        return "gemm_like"
+    if any(token in lowered for token in ATTENTION_KERNEL_TOKENS):
+        return "attention_like"
+    if any(token in lowered for token in GATHER_KERNEL_TOKENS):
+        return "gather_like"
+    return "other"
+
+
+def summarize_ncu_report(report_path: Path) -> Dict[str, Any]:
+    result = run(
+        [
+            "ncu",
+            "--import",
+            str(report_path),
+            "--csv",
+            "--metrics",
+            "gpu__time_duration.sum",
+        ],
+        capture_output=True,
+    )
+
+    import csv
+    import io
+
+    rows = list(csv.DictReader(io.StringIO(result.stdout)))
+    per_kernel: Dict[str, Dict[str, Any]] = {}
+
+    for row in rows:
+        metric_name = row.get("Metric Name")
+        if metric_name not in {"gpu__time_duration.sum", "Duration"}:
+            continue
+
+        kernel_id = row.get("ID")
+        if kernel_id is None:
+            continue
+
+        duration_ns = metric_value_to_ns(
+            row.get("Metric Value", ""),
+            row.get("Metric Unit", ""),
+        )
+        if duration_ns is None:
+            continue
+
+        per_kernel[kernel_id] = {
+            "kernel_name": row.get("Kernel Name", ""),
+            "duration_ns": duration_ns,
+        }
+
+    family_counts: Dict[str, int] = defaultdict(int)
+    family_time_ns: Dict[str, int] = defaultdict(int)
+    kernel_counter: Counter[str] = Counter()
+
+    for kernel in per_kernel.values():
+        family = classify_kernel_family(kernel["kernel_name"])
+        family_counts[family] += 1
+        family_time_ns[family] += kernel["duration_ns"]
+        kernel_counter[kernel["kernel_name"]] += 1
+
+    total_gpu_time_ns = sum(kernel["duration_ns"] for kernel in per_kernel.values())
+    top_kernels = [
+        {
+            "kernel_name": kernel_name,
+            "count": count,
+            "family": classify_kernel_family(kernel_name),
+        }
+        for kernel_name, count in kernel_counter.most_common(5)
+    ]
+
+    inference_like_kernel_count = sum(
+        family_counts.get(family, 0)
+        for family in ("gemm_like", "attention_like", "gather_like")
+    )
+    rng_copy_kernel_count = sum(
+        family_counts.get(family, 0)
+        for family in ("sampling_like", "copy_like")
+    )
+
+    return {
+        "kernel_id_count": len(per_kernel),
+        "total_gpu_time_ns": total_gpu_time_ns,
+        "family_counts": dict(sorted(family_counts.items())),
+        "family_time_ns": dict(sorted(family_time_ns.items())),
+        "inference_like_kernel_count": inference_like_kernel_count,
+        "rng_copy_kernel_count": rng_copy_kernel_count,
+        "is_rng_copy_only": (
+            len(per_kernel) > 0
+            and inference_like_kernel_count == 0
+            and family_counts.get("other", 0) == 0
+            and rng_copy_kernel_count == len(per_kernel)
+        ),
+        "top_kernels": top_kernels,
+    }
+
+
+NCU_SLICE_METRICS = ",".join(
+    (
+        "gpu__time_duration.sum",
+        "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+        "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed",
+        "sm__warps_active.avg.pct_of_peak_sustained_active",
+    )
+)
+
+NCU_METRIC_ALIASES = {
+    "gpu__time_duration.sum": "duration_ns",
+    "Duration": "duration_ns",
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": "sm_pct",
+    "Compute (SM) Throughput": "sm_pct",
+    "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": "dram_pct",
+    "DRAM Throughput": "dram_pct",
+    "sm__warps_active.avg.pct_of_peak_sustained_active": "warps_pct",
+    "Achieved Occupancy": "warps_pct",
+}
+
+NCU_FAMILIES = (
+    "gemm_like",
+    "attention_like",
+    "gather_like",
+    "copy_like",
+    "sampling_like",
+    "other",
+)
+
+
+def ncu_slice_cache_path(report_path: Path) -> Path:
+    if report_path.name.endswith(".ncu-rep"):
+        return report_path.with_name(report_path.name[:-8] + ".ncu-slice.json")
+    return report_path.with_suffix(report_path.suffix + ".ncu-slice.json")
+
+
+def metric_value_to_float(value: str) -> Optional[float]:
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def average_or_none(total: float, count: int) -> Optional[float]:
+    if count <= 0:
+        return None
+    return total / count
+
+
+def build_ncu_slice_cache(report_path: Path) -> Dict[str, Any]:
+    result = run(
+        [
+            "ncu",
+            "--import",
+            str(report_path),
+            "--csv",
+            "--metrics",
+            NCU_SLICE_METRICS,
+        ],
+        capture_output=True,
+    )
+
+    import csv
+    import io
+
+    launches: Dict[str, Dict[str, Any]] = {}
+    for row in csv.DictReader(io.StringIO(result.stdout)):
+        kernel_id = row.get("ID")
+        kernel_name = row.get("Kernel Name", "")
+        if not kernel_id or not kernel_name:
+            continue
+
+        metric_key = NCU_METRIC_ALIASES.get(row.get("Metric Name", ""))
+        if metric_key is None:
+            continue
+
+        launch = launches.setdefault(
+            kernel_id,
+            {
+                "id": kernel_id,
+                "kernel_name": kernel_name,
+                "family": classify_kernel_family(kernel_name),
+                "process_id": row.get("Process ID", ""),
+                "process_name": row.get("Process Name", ""),
+                "context": row.get("Context", ""),
+                "stream": row.get("Stream", ""),
+                "device": row.get("Device", ""),
+                "cc": row.get("CC", ""),
+                "section_name": row.get("Section Name", ""),
+                "block_size": row.get("Block Size", ""),
+                "grid_size": row.get("Grid Size", ""),
+                "duration_ns": None,
+                "sm_pct": None,
+                "dram_pct": None,
+                "warps_pct": None,
+            },
+        )
+
+        if metric_key == "duration_ns":
+            duration_ns = metric_value_to_ns(
+                row.get("Metric Value", ""),
+                row.get("Metric Unit", ""),
+            )
+            if duration_ns is not None:
+                launch["duration_ns"] = duration_ns
+            continue
+
+        numeric_value = metric_value_to_float(row.get("Metric Value", ""))
+        if numeric_value is not None:
+            launch[metric_key] = numeric_value
+
+    launch_rows = sorted(
+        launches.values(),
+        key=lambda row: (
+            -(row.get("duration_ns") or 0),
+            row["kernel_name"],
+            row["id"],
+        ),
+    )
+
+    family_counts: Dict[str, int] = defaultdict(int)
+    family_time_ns: Dict[str, int] = defaultdict(int)
+    kernel_groups: Dict[str, Dict[str, Any]] = {}
+
+    for launch in launch_rows:
+        family = str(launch["family"])
+        duration_ns = int(launch.get("duration_ns") or 0)
+        family_counts[family] += 1
+        family_time_ns[family] += duration_ns
+
+        group = kernel_groups.setdefault(
+            launch["kernel_name"],
+            {
+                "kernel_name": launch["kernel_name"],
+                "family": family,
+                "count": 0,
+                "total_duration_ns": 0,
+                "duration_sample_count": 0,
+                "sm_total": 0.0,
+                "sm_count": 0,
+                "dram_total": 0.0,
+                "dram_count": 0,
+                "warps_total": 0.0,
+                "warps_count": 0,
+            },
+        )
+        group["count"] += 1
+        if duration_ns > 0:
+            group["total_duration_ns"] += duration_ns
+            group["duration_sample_count"] += 1
+        if launch.get("sm_pct") is not None:
+            group["sm_total"] += float(launch["sm_pct"])
+            group["sm_count"] += 1
+        if launch.get("dram_pct") is not None:
+            group["dram_total"] += float(launch["dram_pct"])
+            group["dram_count"] += 1
+        if launch.get("warps_pct") is not None:
+            group["warps_total"] += float(launch["warps_pct"])
+            group["warps_count"] += 1
+
+    kernel_rows: List[Dict[str, Any]] = []
+    for kernel_name, group in kernel_groups.items():
+        avg_duration_ns = average_or_none(
+            float(group["total_duration_ns"]),
+            int(group["duration_sample_count"]),
+        )
+        kernel_rows.append(
+            {
+                "kernel_name": kernel_name,
+                "family": str(group["family"]),
+                "count": int(group["count"]),
+                "total_duration_ns": int(group["total_duration_ns"]),
+                "avg_duration_ns": int(avg_duration_ns) if avg_duration_ns is not None else None,
+                "avg_sm_pct": average_or_none(group["sm_total"], group["sm_count"]),
+                "avg_dram_pct": average_or_none(group["dram_total"], group["dram_count"]),
+                "avg_warps_pct": average_or_none(group["warps_total"], group["warps_count"]),
+            }
+        )
+
+    kernel_rows.sort(
+        key=lambda row: (
+            -(row.get("total_duration_ns") or 0),
+            -(row.get("count") or 0),
+            row["kernel_name"],
+        )
+    )
+
+    total_gpu_time_ns = sum(int(row.get("duration_ns") or 0) for row in launch_rows)
+    report_stat = report_path.stat()
+    return {
+        "report_path": str(report_path),
+        "report_size_bytes": report_stat.st_size,
+        "report_mtime_ns": report_stat.st_mtime_ns,
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "metrics": NCU_SLICE_METRICS.split(","),
+        "summary": {
+            "kernel_id_count": len(launch_rows),
+            "kernel_name_count": len(kernel_rows),
+            "total_gpu_time_ns": total_gpu_time_ns,
+            "family_counts": dict(sorted(family_counts.items())),
+            "family_time_ns": dict(sorted(family_time_ns.items())),
+            "top_kernels": kernel_rows[:20],
+        },
+        "launches": launch_rows,
+        "kernels": kernel_rows,
+    }
+
+
+def load_ncu_slice_cache(report_path: Path, refresh: bool = False) -> Dict[str, Any]:
+    cache_path = ncu_slice_cache_path(report_path)
+    report_stat = report_path.stat()
+
+    if not refresh and cache_path.exists():
+        cache = read_json(cache_path)
+        if (
+            cache.get("report_path") == str(report_path)
+            and int(cache.get("report_size_bytes", -1)) == report_stat.st_size
+            and int(cache.get("report_mtime_ns", -1)) == report_stat.st_mtime_ns
+        ):
+            return cache
+
+    cache = build_ncu_slice_cache(report_path)
+    write_json(cache_path, cache)
+    return cache
+
+
+def ns_to_ms_text(value: Optional[int]) -> str:
+    if value is None:
+        return "-"
+    return f"{value / 1_000_000.0:.3f}"
+
+
+def pct_text(value: Optional[float]) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.2f}"
+
+
+def truncate_text(value: str, max_len: int) -> str:
+    if len(value) <= max_len:
+        return value
+    if max_len <= 3:
+        return value[:max_len]
+    return value[: max_len - 3] + "..."
+
+
+def print_table(rows: Sequence[Dict[str, Any]], columns: Sequence[Tuple[str, str]]) -> None:
+    widths = []
+    for key, header in columns:
+        width = len(header)
+        for row in rows:
+            width = max(width, len(str(row.get(key, ""))))
+        widths.append(width)
+
+    header_line = "  ".join(header.ljust(width) for (_, header), width in zip(columns, widths))
+    print(header_line)
+    print("  ".join("-" * width for width in widths))
+    for row in rows:
+        print(
+            "  ".join(
+                str(row.get(key, "")).ljust(width)
+                for (key, _), width in zip(columns, widths)
+            )
+        )
+
+
+def inspect_ncu_command(args: argparse.Namespace) -> int:
+    config = load_run_config()
+    report_path: Optional[Path] = None
+
+    if args.report:
+        report_path = Path(args.report).resolve()
+    else:
+        phase_profile = config.get("profiles", {}).get(args.phase or "")
+        if isinstance(phase_profile, dict) and phase_profile.get("ncu_rep"):
+            report_path = Path(str(phase_profile["ncu_rep"])).resolve()
+
+    if report_path is None:
+        if args.phase:
+            fail(
+                f"No registered Nsight Compute report is recorded for phase '{args.phase}'. "
+                "Pass --report explicitly or rerun the corresponding profiling step."
+            )
+        fail("Provide --report or --phase for a registered Nsight Compute report.")
+    if not report_path.exists():
+        fail(f"Nsight Compute report not found: {report_path}")
+
+    cache = load_ncu_slice_cache(report_path, refresh=args.refresh_cache)
+
+    family_filter = None if args.family == "all" else args.family
+    name_filter = (args.name_contains or "").lower()
+
+    def include_row(row: Dict[str, Any]) -> bool:
+        if family_filter and row.get("family") != family_filter:
+            return False
+        if name_filter and name_filter not in str(row.get("kernel_name", "")).lower():
+            return False
+        return True
+
+    if args.view == "summary":
+        summary = cache["summary"]
+        family_counts = summary.get("family_counts", {})
+        family_time_ns = summary.get("family_time_ns", {})
+        rows = []
+        for family in NCU_FAMILIES:
+            if family_filter and family != family_filter:
+                continue
+            count = int(family_counts.get(family, 0))
+            total_ns = int(family_time_ns.get(family, 0))
+            if count == 0 and total_ns == 0:
+                continue
+            rows.append(
+                {
+                    "family": family,
+                    "count": count,
+                    "total_ms": ns_to_ms_text(total_ns),
+                }
+            )
+
+        if args.format == "json":
+            print(
+                json.dumps(
+                    {
+                        "report_path": str(report_path),
+                        "cache_path": str(ncu_slice_cache_path(report_path)),
+                        "summary": summary,
+                    },
+                    indent=2,
+                )
+            )
+            return 0
+
+        print(f"report: {report_path}")
+        print(f"cache:  {ncu_slice_cache_path(report_path)}")
+        print(f"launches: {summary.get('kernel_id_count', 0)}")
+        print(f"kernel names: {summary.get('kernel_name_count', 0)}")
+        print(f"total gpu time (ms): {ns_to_ms_text(summary.get('total_gpu_time_ns'))}")
+        print("")
+        if rows:
+            print("family breakdown:")
+            print_table(rows, (("family", "family"), ("count", "count"), ("total_ms", "total_ms")))
+            print("")
+
+        top_rows = []
+        for row in cache["kernels"]:
+            if not include_row(row):
+                continue
+            top_rows.append(
+                {
+                    "family": row["family"],
+                    "count": row["count"],
+                    "total_ms": ns_to_ms_text(row.get("total_duration_ns")),
+                    "avg_ms": ns_to_ms_text(row.get("avg_duration_ns")),
+                    "name": truncate_text(str(row["kernel_name"]), 90),
+                }
+            )
+            if len(top_rows) >= args.limit:
+                break
+
+        if top_rows:
+            print("top kernels by total gpu time:")
+            print_table(
+                top_rows,
+                (
+                    ("family", "family"),
+                    ("count", "count"),
+                    ("total_ms", "total_ms"),
+                    ("avg_ms", "avg_ms"),
+                    ("name", "kernel_name"),
+                ),
+            )
+        return 0
+
+    items = cache["kernels"] if args.view == "kernels" else cache["launches"]
+    filtered = [row for row in items if include_row(row)]
+
+    sort_key = args.sort
+    def sort_value(row: Dict[str, Any]) -> Any:
+        metric_value: Optional[float]
+        if sort_key == "count":
+            return -(row.get("count") or 0)
+        if sort_key == "total_ms":
+            return -(row.get("total_duration_ns") or 0)
+        if sort_key == "avg_ms":
+            return -(row.get("avg_duration_ns") or row.get("duration_ns") or 0)
+        if sort_key == "sm_pct":
+            metric_value = row.get("avg_sm_pct") if args.view == "kernels" else row.get("sm_pct")
+            return -(metric_value if metric_value is not None else -1)
+        if sort_key == "dram_pct":
+            metric_value = row.get("avg_dram_pct") if args.view == "kernels" else row.get("dram_pct")
+            return -(metric_value if metric_value is not None else -1)
+        if sort_key == "warps_pct":
+            metric_value = row.get("avg_warps_pct") if args.view == "kernels" else row.get("warps_pct")
+            return -(metric_value if metric_value is not None else -1)
+        if sort_key == "id":
+            return int(row.get("id") or 0)
+        return -(row.get("total_duration_ns") or row.get("duration_ns") or 0)
+
+    filtered.sort(key=lambda row: (sort_value(row), str(row.get("kernel_name", "")), str(row.get("id", ""))))
+    filtered = filtered[: args.limit]
+
+    if args.format == "json":
+        print(json.dumps(filtered, indent=2))
+        return 0
+
+    if args.view == "kernels":
+        rows = [
+            {
+                "family": row["family"],
+                "count": row["count"],
+                "total_ms": ns_to_ms_text(row.get("total_duration_ns")),
+                "avg_ms": ns_to_ms_text(row.get("avg_duration_ns")),
+                "sm_pct": pct_text(row.get("avg_sm_pct")),
+                "dram_pct": pct_text(row.get("avg_dram_pct")),
+                "warps_pct": pct_text(row.get("avg_warps_pct")),
+                "kernel_name": truncate_text(str(row["kernel_name"]), 90),
+            }
+            for row in filtered
+        ]
+        print_table(
+            rows,
+            (
+                ("family", "family"),
+                ("count", "count"),
+                ("total_ms", "total_ms"),
+                ("avg_ms", "avg_ms"),
+                ("sm_pct", "sm_pct"),
+                ("dram_pct", "dram_pct"),
+                ("warps_pct", "warps_pct"),
+                ("kernel_name", "kernel_name"),
+            ),
+        )
+        return 0
+
+    rows = [
+        {
+            "id": row["id"],
+            "family": row["family"],
+            "duration_ms": ns_to_ms_text(row.get("duration_ns")),
+            "sm_pct": pct_text(row.get("sm_pct")),
+            "dram_pct": pct_text(row.get("dram_pct")),
+            "warps_pct": pct_text(row.get("warps_pct")),
+            "kernel_name": truncate_text(str(row["kernel_name"]), 80),
+        }
+        for row in filtered
+    ]
+    print_table(
+        rows,
+        (
+            ("id", "id"),
+            ("family", "family"),
+            ("duration_ms", "duration_ms"),
+            ("sm_pct", "sm_pct"),
+            ("dram_pct", "dram_pct"),
+            ("warps_pct", "warps_pct"),
+            ("kernel_name", "kernel_name"),
+        ),
+    )
+    return 0
+
+
 def default_run_config() -> Dict[str, Any]:
     return {
         "requested_model_id": REQUESTED_MODEL_ID,
@@ -171,7 +781,7 @@ def default_run_config() -> Dict[str, Any]:
             "prompt": DEFAULT_PROMPT,
             "max_new_tokens": DEFAULT_MAX_NEW_TOKENS,
         },
-        "precision_probe_order": PRECISION_ORDER,
+        "precision_probe_order": sanitize_precision_order(None),
         "candidate_models": MODEL_CANDIDATES,
         "artifacts": {
             "artifacts_dir": str(ARTIFACTS_DIR),
@@ -188,10 +798,16 @@ def load_run_config() -> Dict[str, Any]:
     if RUN_CONFIG_PATH.exists():
         existing = read_json(RUN_CONFIG_PATH)
         config.update(existing)
+    config["precision_probe_order"] = sanitize_precision_order(
+        config.get("precision_probe_order")
+    )
     return config
 
 
 def save_run_config(config: Dict[str, Any]) -> None:
+    config["precision_probe_order"] = sanitize_precision_order(
+        config.get("precision_probe_order")
+    )
     write_json(RUN_CONFIG_PATH, config)
 
 
@@ -294,7 +910,7 @@ def detect_tensorrt_llm_support() -> Dict[str, Any]:
         support["installed"] = True
     except Exception:
         support["errors"].append(
-            "Package metadata for tensorrt_llm was not found in /home/songzhu/Desktop/dl_env."
+            f"Package metadata for tensorrt_llm was not found for interpreter {sys.executable}."
         )
         return support
 
@@ -577,9 +1193,9 @@ def preflight_command(_: argparse.Namespace) -> int:
     if not host_info["ncu_path"] or not host_info["nsys_path"]:
         fail("Both ncu and nsys must be available before profiling.")
     if not python_stack.get("torch_cuda_available"):
-        fail("torch.cuda.is_available() is false in /home/songzhu/Desktop/dl_env.")
+        fail(f"torch.cuda.is_available() is false for interpreter {sys.executable}.")
     if not tllm_support["installed"]:
-        fail("tensorrt_llm is not installed in /home/songzhu/Desktop/dl_env.")
+        fail(f"tensorrt_llm is not installed for interpreter {sys.executable}.")
     if not tllm_support.get("importable"):
         if tllm_support.get("missing_openmpi_runtime"):
             fail(
@@ -589,7 +1205,7 @@ def preflight_command(_: argparse.Namespace) -> int:
             )
         detail = "; ".join(tllm_support.get("errors", [])) or "unknown import error"
         fail(
-            "TensorRT-LLM is installed but cannot be imported in /home/songzhu/Desktop/dl_env: "
+            f"TensorRT-LLM is installed but cannot be imported for interpreter {sys.executable}: "
             f"{detail}"
         )
     if not tllm_support["gemma4_autodeploy_supported"]:
@@ -683,11 +1299,22 @@ def prepare_model_command(_: argparse.Namespace) -> int:
 def prepare_runtime_command(args: argparse.Namespace) -> int:
     ensure_dirs()
     config = load_run_config()
+    precision_probe_order = sanitize_precision_order(config.get("precision_probe_order"))
+    config["precision_probe_order"] = precision_probe_order
     if "prepared_models" not in config:
         prepare_model_command(argparse.Namespace())
         config = load_run_config()
+        precision_probe_order = sanitize_precision_order(config.get("precision_probe_order"))
+        config["precision_probe_order"] = precision_probe_order
 
     selected = config.get("selected_runtime")
+    if selected and selected.get("precision") not in precision_probe_order:
+        log(
+            "Existing runtime selection uses disabled precision "
+            f"{selected.get('precision')}; re-probing allowed precisions."
+        )
+        config.pop("selected_runtime", None)
+        selected = None
     if (
         selected
         and not args.force
@@ -707,7 +1334,7 @@ def prepare_runtime_command(args: argparse.Namespace) -> int:
         prompt_text = prompt_path.read_text()
         prompt_tokens = int(prompt_meta["input_token_count"])
 
-        for precision in PRECISION_ORDER:
+        for precision in precision_probe_order:
             support = precision_support.get(precision, {})
             if not support.get("supported"):
                 record_failure(failures, model_id, precision, support.get("reason", "Unsupported precision."))
@@ -751,7 +1378,6 @@ def prepare_runtime_command(args: argparse.Namespace) -> int:
                 "cache_paths": {
                     "hf_home": os.environ["HF_HOME"],
                     "huggingface_hub_cache": os.environ["HUGGINGFACE_HUB_CACHE"],
-                    "transformers_cache": os.environ["TRANSFORMERS_CACHE"],
                     "torchinductor_cache_dir": os.environ["TORCHINDUCTOR_CACHE_DIR"],
                     "triton_cache_dir": os.environ["TRITON_CACHE_DIR"],
                     "tllm_llmapi_build_cache_root": os.environ["TLLM_LLMAPI_BUILD_CACHE_ROOT"],
@@ -788,6 +1414,13 @@ def load_selected_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
     if not runtime:
         fail(
             "No selected_runtime is present in artifacts/run_config.json. Run 03_build_or_prepare_runtime.sh first."
+        )
+    precision_probe_order = sanitize_precision_order(config.get("precision_probe_order"))
+    if runtime.get("precision") not in precision_probe_order:
+        fail(
+            "selected_runtime uses disabled precision "
+            f"{runtime.get('precision')}. Run 03_build_or_prepare_runtime.sh again "
+            f"to select one of {precision_probe_order}."
         )
     return runtime
 
@@ -830,8 +1463,10 @@ def run_inference_command(args: argparse.Namespace) -> int:
 
     metadata.update(
         {
+            "actual_output_token_count": metadata.get("output_token_count"),
             "model_id": runtime["actual_model_id"],
             "requested_model_id": runtime["requested_model_id"],
+            "requested_max_new_tokens": max_new_tokens,
             "precision": runtime["precision"],
             "dtype": runtime["dtype"],
             "max_new_tokens": max_new_tokens,
@@ -1009,8 +1644,55 @@ def register_ncu_command(args: argparse.Namespace) -> int:
     config = load_run_config()
     profiles = config.setdefault("profiles", {})
     phase_profile = profiles.setdefault(args.phase, {})
-    phase_profile["ncu_rep"] = str(Path(args.report).resolve())
-    phase_profile["ncu_registered_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    report_path = Path(args.report).resolve()
+    metadata_path = Path(args.metadata).resolve() if args.metadata else None
+    ncu_summary = summarize_ncu_report(report_path)
+    registered_at = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    metadata_payload: Dict[str, Any] = {}
+    if metadata_path and metadata_path.exists():
+        metadata_payload = read_json(metadata_path)
+
+    requested_max_new_tokens = args.requested_max_new_tokens
+    if requested_max_new_tokens is None:
+        requested_max_new_tokens = metadata_payload.get("requested_max_new_tokens")
+    if requested_max_new_tokens is None:
+        requested_max_new_tokens = metadata_payload.get("max_new_tokens")
+
+    if requested_max_new_tokens is None:
+        requested_max_new_tokens = 0 if args.phase == "prefill" else None
+
+    actual_output_token_count = metadata_payload.get("actual_output_token_count")
+    if actual_output_token_count is None:
+        actual_output_token_count = metadata_payload.get("output_token_count")
+    if actual_output_token_count is None and metadata_payload.get("direct_inference"):
+        actual_output_token_count = 0 if args.phase == "prefill" else requested_max_new_tokens
+
+    if metadata_path:
+        metadata_payload["collection_backend"] = args.collection_backend
+        metadata_payload["replay_mode"] = args.replay_mode
+        metadata_payload["collection_profile"] = args.collection_profile
+        metadata_payload["requested_max_new_tokens"] = requested_max_new_tokens
+        metadata_payload["actual_output_token_count"] = actual_output_token_count
+        metadata_payload["report_created_at"] = registered_at
+        metadata_payload["ncu_summary"] = ncu_summary
+        if metadata_path.exists() or metadata_payload:
+            write_json(metadata_path, metadata_payload)
+
+    phase_profile["ncu_rep"] = str(report_path)
+    phase_profile["ncu_registered_at"] = registered_at
+    phase_profile["ncu_collection_backend"] = args.collection_backend
+    phase_profile["ncu_replay_mode"] = args.replay_mode
+    phase_profile["ncu_collection_profile"] = args.collection_profile
+    phase_profile["ncu_requested_max_new_tokens"] = requested_max_new_tokens
+    phase_profile["ncu_actual_output_token_count"] = actual_output_token_count
+    phase_profile["ncu_summary"] = ncu_summary
+    if metadata_path:
+        phase_profile["ncu_metadata_json"] = str(metadata_path)
+    if "proxy_fallback" in metadata_payload:
+        phase_profile["ncu_proxy_fallback"] = metadata_payload["proxy_fallback"]
+    if "direct_inference" in metadata_payload:
+        phase_profile["ncu_direct_inference"] = metadata_payload["direct_inference"]
     save_run_config(config)
     return 0
 
@@ -1060,9 +1742,37 @@ def report_config_command(args: argparse.Namespace) -> int:
         phase_profile = config.get("profiles", {}).get(phase, {})
         if phase_profile:
             lines.append(f"{phase.title()} artifacts:")
-            for key in ("nsys_rep", "nsys_sqlite", "summary_json", "ncu_rep"):
+            for key in ("nsys_rep", "nsys_sqlite", "summary_json", "ncu_rep", "ncu_metadata_json"):
                 if phase_profile.get(key):
                     lines.append(f"  - {key}: {phase_profile[key]}")
+            if phase_profile.get("ncu_collection_backend"):
+                lines.append(f"  - ncu_backend: {phase_profile['ncu_collection_backend']}")
+            if phase_profile.get("ncu_replay_mode"):
+                lines.append(f"  - ncu_replay_mode: {phase_profile['ncu_replay_mode']}")
+            if phase_profile.get("ncu_collection_profile"):
+                lines.append(f"  - ncu_collection_profile: {phase_profile['ncu_collection_profile']}")
+            if "ncu_proxy_fallback" in phase_profile:
+                lines.append(f"  - ncu_proxy_fallback: {phase_profile['ncu_proxy_fallback']}")
+            if phase_profile.get("ncu_requested_max_new_tokens") is not None:
+                lines.append(
+                    f"  - ncu_requested_max_new_tokens: {phase_profile['ncu_requested_max_new_tokens']}"
+                )
+            if phase_profile.get("ncu_actual_output_token_count") is not None:
+                lines.append(
+                    f"  - ncu_actual_output_token_count: {phase_profile['ncu_actual_output_token_count']}"
+                )
+            ncu_summary = phase_profile.get("ncu_summary")
+            if isinstance(ncu_summary, dict):
+                lines.append(
+                    f"  - ncu_kernel_ids: {ncu_summary.get('kernel_id_count')}"
+                )
+                lines.append(
+                    f"  - ncu_total_gpu_time_ms: "
+                    f"{round(ncu_summary.get('total_gpu_time_ns', 0) / 1_000_000.0, 3)}"
+                )
+                family_counts = ncu_summary.get("family_counts")
+                if isinstance(family_counts, dict) and family_counts:
+                    lines.append(f"  - ncu_family_counts: {family_counts}")
 
     report_text = "\n".join(lines) + "\n"
     print(report_text, end="")
@@ -1138,6 +1848,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     register_ncu.add_argument("--phase", choices=["prefill", "decode"], required=True)
     register_ncu.add_argument("--report", required=True)
+    register_ncu.add_argument("--metadata", default=None)
+    register_ncu.add_argument("--collection-backend", required=True)
+    register_ncu.add_argument("--replay-mode", required=True)
+    register_ncu.add_argument("--collection-profile", required=True)
+    register_ncu.add_argument("--requested-max-new-tokens", type=int, default=None)
+
+    inspect_ncu = subparsers.add_parser(
+        "inspect-ncu",
+        help="Query an .ncu-rep report through a cache-backed CLI instead of the GUI.",
+    )
+    inspect_ncu.add_argument("--report", default=None)
+    inspect_ncu.add_argument("--phase", choices=["prefill", "decode"], default=None)
+    inspect_ncu.add_argument(
+        "--view",
+        choices=["summary", "kernels", "launches"],
+        default="summary",
+    )
+    inspect_ncu.add_argument(
+        "--family",
+        choices=["all", *NCU_FAMILIES],
+        default="all",
+    )
+    inspect_ncu.add_argument("--name-contains", default=None)
+    inspect_ncu.add_argument(
+        "--sort",
+        choices=["total_ms", "avg_ms", "count", "sm_pct", "dram_pct", "warps_pct", "id"],
+        default="total_ms",
+    )
+    inspect_ncu.add_argument("--limit", type=int, default=10)
+    inspect_ncu.add_argument("--refresh-cache", action="store_true")
+    inspect_ncu.add_argument("--format", choices=["table", "json"], default="table")
 
     report_config = subparsers.add_parser(
         "report-config",
@@ -1168,6 +1909,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return nvtx_filter_command(args)
         if args.command == "register-ncu":
             return register_ncu_command(args)
+        if args.command == "inspect-ncu":
+            return inspect_ncu_command(args)
         if args.command == "report-config":
             return report_config_command(args)
     except WorkflowError as exc:
