@@ -1693,6 +1693,10 @@ def register_ncu_command(args: argparse.Namespace) -> int:
         phase_profile["ncu_proxy_fallback"] = metadata_payload["proxy_fallback"]
     if "direct_inference" in metadata_payload:
         phase_profile["ncu_direct_inference"] = metadata_payload["direct_inference"]
+    if "execution_path" in metadata_payload:
+        phase_profile["ncu_execution_path"] = metadata_payload["execution_path"]
+    if "execution_path_detail" in metadata_payload:
+        phase_profile["ncu_execution_path_detail"] = metadata_payload["execution_path_detail"]
     save_run_config(config)
     return 0
 
@@ -1753,6 +1757,12 @@ def report_config_command(args: argparse.Namespace) -> int:
                 lines.append(f"  - ncu_collection_profile: {phase_profile['ncu_collection_profile']}")
             if "ncu_proxy_fallback" in phase_profile:
                 lines.append(f"  - ncu_proxy_fallback: {phase_profile['ncu_proxy_fallback']}")
+            if phase_profile.get("ncu_execution_path"):
+                lines.append(f"  - ncu_execution_path: {phase_profile['ncu_execution_path']}")
+            if phase_profile.get("ncu_execution_path_detail"):
+                lines.append(
+                    f"  - ncu_execution_path_detail: {phase_profile['ncu_execution_path_detail']}"
+                )
             if phase_profile.get("ncu_requested_max_new_tokens") is not None:
                 lines.append(
                     f"  - ncu_requested_max_new_tokens: {phase_profile['ncu_requested_max_new_tokens']}"

@@ -158,6 +158,23 @@ def try_load_real_model(model_id: str):
         return None
 
 
+def describe_execution_path(
+    *,
+    using_proxy: bool,
+    bundle_type: str | None,
+) -> Tuple[str, str]:
+    if using_proxy:
+        return (
+            "structural_proxy",
+            "structural proxy fallback (Gemma-like FFN stack, single process)",
+        )
+    bundle_label = bundle_type or "unknown_bundle"
+    return (
+        "direct_hf_real_model",
+        f"single-process HuggingFace real-model inference ({bundle_label})",
+    )
+
+
 def synchronize_cuda() -> None:
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -332,6 +349,10 @@ def main() -> int:
     model = try_load_real_model(model_id)
     bundle_type, bundle = try_load_text_bundle(model_id)
     using_proxy = model is None or bundle is None
+    execution_path, execution_path_detail = describe_execution_path(
+        using_proxy=using_proxy,
+        bundle_type=bundle_type,
+    )
     started_at = time.time()
     actual_output_token_count = 0
 
@@ -339,6 +360,11 @@ def main() -> int:
         del model
         torch.cuda.empty_cache()
         model = None
+
+    log(
+        "Selected Nsight Compute direct-inference path: "
+        f"{execution_path_detail}."
+    )
 
     if args.phase == "prefill":
         if bundle is not None and bundle_type is not None:
@@ -403,6 +429,10 @@ def main() -> int:
                 "requested_max_new_tokens": requested_max_new_tokens,
                 "direct_inference": True,
                 "proxy_fallback": using_proxy,
+                "execution_path": execution_path,
+                "execution_path_detail": execution_path_detail,
+                "real_model_loaded": model is not None,
+                "text_bundle_type": bundle_type,
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             },
         )
