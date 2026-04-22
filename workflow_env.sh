@@ -59,7 +59,7 @@ print(sysconfig.get_paths()["purelib"])
 PY
 )"
 else
-  PYTHON_SITE_PACKAGES="$DL_ENV_ROOT/lib/python3.10/site-packages"
+  PYTHON_SITE_PACKAGES="$DL_ENV_ROOT/lib/python3.12/site-packages"
 fi
 
 if [[ -d "$DL_ENV_ROOT/share/openmpi" ]]; then
@@ -92,13 +92,13 @@ function workflow_log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
 }
 
-function python_env_is_python310() {
+function python_env_is_python312() {
   local python_bin="${1:-$PYTHON_BIN}"
 
   "$python_bin" - <<'PY' >/dev/null 2>&1
 import sys
 
-raise SystemExit(0 if sys.version_info[:2] == (3, 10) else 1)
+raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 1)
 PY
 }
 
@@ -113,8 +113,8 @@ function require_python_env() {
     exit 1
   fi
 
-  if ! python_env_is_python310 "$PYTHON_BIN"; then
-    workflow_log "Expected Python 3.10 interpreter at $PYTHON_BIN"
+  if ! python_env_is_python312 "$PYTHON_BIN"; then
+    workflow_log "Expected Python 3.12 interpreter at $PYTHON_BIN"
     exit 1
   fi
 }

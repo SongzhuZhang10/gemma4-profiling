@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Helper entrypoints for the Gemma 4 WSL2 profiling workflow."""
+"""Helper entrypoints for the Gemma 4 GPU profiling workflow."""
 
 from __future__ import annotations
 
@@ -1188,8 +1188,6 @@ def preflight_command(_: argparse.Namespace) -> int:
     tllm_support = detect_tensorrt_llm_support()
     precision_support = gather_precision_support()
 
-    if not host_info["is_wsl2"]:
-        fail("This workflow expects Ubuntu running on WSL2.")
     if not host_info["ncu_path"] or not host_info["nsys_path"]:
         fail("Both ncu and nsys must be available before profiling.")
     if not python_stack.get("torch_cuda_available"):

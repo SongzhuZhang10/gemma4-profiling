@@ -13,7 +13,7 @@ function env_is_usable() {
     return 1
   fi
 
-  python_env_is_python310 "$DL_ENV_ROOT/bin/python"
+  python_env_is_python312 "$DL_ENV_ROOT/bin/python"
 }
 
 function ensure_selected_python_env() {
@@ -25,7 +25,7 @@ function ensure_selected_python_env() {
     fi
 
     if ! env_is_usable; then
-      workflow_log "Legacy Python environment at $DL_ENV_ROOT is not a usable Python 3.10 virtual environment."
+      workflow_log "Legacy Python environment at $DL_ENV_ROOT is not a usable Python 3.12 virtual environment."
       workflow_log "Please repair or remove that directory so the workflow can create and use $FALLBACK_DL_ENV_ROOT instead."
       exit 1
     fi
@@ -39,23 +39,27 @@ function ensure_selected_python_env() {
     return 0
   fi
 
-  if ! command -v python3.10 >/dev/null 2>&1; then
-    workflow_log "python3.10 was not found in PATH."
-    workflow_log "Install Python 3.10 on this machine first, then rerun 01_install.sh."
+  if ! command -v python3.12 >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
+    workflow_log "python3.12 was not found in PATH."
+    workflow_log "Install Python 3.12 on this machine first, then rerun 01_install.sh."
     exit 1
   fi
 
-  if ! python_env_is_python310 "$(command -v python3.10)"; then
-    workflow_log "The python3.10 command does not report Python 3.10 as expected."
+  local python312_bin
+  python312_bin="$(command -v python3.12 2>/dev/null || command -v python3)"
+
+  if ! python_env_is_python312 "$python312_bin"; then
+    workflow_log "The python3 command does not report Python 3.12 as expected (found: $("$python312_bin" --version 2>&1))."
     exit 1
   fi
 
-  workflow_log "Creating or repairing the portable Python 3.10 virtual environment at $DL_ENV_ROOT."
+  workflow_log "Creating or repairing the portable Python 3.12 virtual environment at $DL_ENV_ROOT."
   mkdir -p "$(dirname "$DL_ENV_ROOT")"
-  python3.10 -m venv "$DL_ENV_ROOT"
+  "$python312_bin" -m venv --without-pip --system-site-packages "$DL_ENV_ROOT"
+  curl -sS https://bootstrap.pypa.io/get-pip.py | "$DL_ENV_ROOT/bin/python3"
 
   if ! env_is_usable; then
-    workflow_log "Python 3.10 virtual environment creation completed, but $DL_ENV_ROOT is still not usable."
+    workflow_log "Python 3.12 virtual environment creation completed, but $DL_ENV_ROOT is still not usable."
     exit 1
   fi
 }
@@ -101,30 +105,62 @@ PY
 }
 
 function ensure_pinned_python_stack() {
-  workflow_log "Installing or updating packaging tools inside $DL_ENV_ROOT."
-  "$PIP_BIN" install --upgrade pip 'setuptools<80' wheel
+  local torch_constraints_file
+  local torch_cuda_index_url="https://download.pytorch.org/whl/cu130"
 
-  workflow_log "Installing pinned PyTorch packages for CUDA 12.8 inside $DL_ENV_ROOT."
+  workflow_log "Installing or updating packaging tools inside $DL_ENV_ROOT."
+  "$PIP_BIN" install --upgrade pip 'setuptools<80' 'wheel<=0.45.1'
+
+  workflow_log "Installing pinned CUDA 13.0 PyTorch packages for aarch64 inside $DL_ENV_ROOT."
   "$PIP_BIN" install --upgrade \
-    --index-url https://download.pytorch.org/whl/cu128 \
+    --index-url "$torch_cuda_index_url" \
     --extra-index-url https://pypi.org/simple \
-    torch==2.9.1+cu128 \
-    torchvision==0.24.1+cu128
+    'torch==2.9.0+cu130' \
+    torchvision==0.24.0
+
+  # TensorRT-LLM can cause pip to replace the CUDA-enabled torch wheel with the
+  # CPU-only build unless torch is constrained during dependency resolution.
+  torch_constraints_file="$(mktemp)"
+  cat >"$torch_constraints_file" <<'EOF'
+torch==2.9.0+cu130
+torchvision==0.24.0
+EOF
 
   workflow_log "Installing pinned workflow packages inside $DL_ENV_ROOT."
   "$PIP_BIN" install --upgrade \
-    tensorrt-llm==1.2.0 \
-    transformers==4.57.3 \
+    --extra-index-url "$torch_cuda_index_url" \
+    --extra-index-url https://pypi.nvidia.com \
+    -c "$torch_constraints_file" \
+    tensorrt-llm==1.1.0 \
+    transformers==4.56.0 \
     PyYAML==6.0.3 \
     sentencepiece==0.2.1 \
     Pillow==12.1.1 \
     accelerate==1.13.0 \
     huggingface_hub==0.36.2
+
+  rm -f "$torch_constraints_file"
 }
 
 ensure_selected_python_env
 require_python_env
 ensure_workflow_dirs
+
+workflow_log "Verifying CUDA and profiler tooling before Python-side installs."
+
+for required_cmd in nvidia-smi ncu nsys; do
+  if ! command -v "$required_cmd" >/dev/null 2>&1; then
+    workflow_log "Required command '$required_cmd' was not found in PATH."
+    workflow_log "Please install the missing tool (e.g. via apt or the NVIDIA SDK Manager) and rerun 01_install.sh."
+    exit 1
+  fi
+done
+
+# Print the exact GPU and profiler details that the rest of the workflow will rely on.
+nvidia-smi --query-gpu=name,memory.total,driver_version,compute_cap --format=csv,noheader
+ncu --version
+nsys --version
+
 ensure_vscode_settings
 ensure_pinned_python_stack
 
@@ -138,10 +174,6 @@ function has_local_openmpi_runtime() {
   [[ -f "$DL_ENV_ROOT/lib/libmpi.so.40" && -d "$DL_ENV_ROOT/share/openmpi" ]]
 }
 
-function has_cuda13_cublas_runtime() {
-  [[ -f "$site_packages_dir/nvidia/cu13/lib/libcublasLt.so.13" && -f "$site_packages_dir/nvidia/cu13/lib/libcublas.so.13" ]]
-}
-
 function refresh_native_runtime_env() {
   export PATH="$DL_ENV_ROOT/bin:$PATH"
   export OPAL_PREFIX="${OPAL_PREFIX:-$DL_ENV_ROOT}"
@@ -149,7 +181,7 @@ function refresh_native_runtime_env() {
   for native_dir in \
     "$DL_ENV_ROOT/lib" \
     "$DL_ENV_ROOT/lib/openmpi" \
-    "$site_packages_dir/nvidia/cu13/lib" \
+    "/usr/local/cuda/lib64" \
     "$site_packages_dir/nvidia/nccl/lib" \
     "$site_packages_dir/tensorrt_libs"; do
     if [[ -d "$native_dir" && ":${LD_LIBRARY_PATH:-}:" != *":$native_dir:"* ]]; then
@@ -170,22 +202,6 @@ function ensure_openmpi_runtime() {
 
   if ! has_local_openmpi_runtime; then
     workflow_log "OpenMPI installation finished, but the expected local runtime files were not created."
-    exit 1
-  fi
-}
-
-function ensure_cuda13_cublas_runtime() {
-  if has_cuda13_cublas_runtime; then
-    refresh_native_runtime_env
-    return 0
-  fi
-
-  workflow_log "Installing CUDA 13 CUBLAS runtime into $DL_ENV_ROOT."
-  "$PIP_BIN" install --upgrade nvidia-cublas==13.3.0.5
-  refresh_native_runtime_env
-
-  if ! has_cuda13_cublas_runtime; then
-    workflow_log "CUDA 13 CUBLAS installation finished, but libcublas.so.13 was not found."
     exit 1
   fi
 }
@@ -218,9 +234,6 @@ function ensure_tensorrt_llm_importable() {
     if grep -Eq 'libmpi\.so\.40|cannot load MPI library|orte_init:startup:internal-failure|mpi_init:startup:internal-failure|/opt/openmpi/share/openmpi' "$import_error_log"; then
       workflow_log "TensorRT-LLM is installed, but its native bindings need the OpenMPI runtime configured."
       ensure_openmpi_runtime
-    elif grep -Eq 'libcublasLt\.so\.13|libcublas\.so\.13' "$import_error_log"; then
-      workflow_log "TensorRT-LLM is installed, but its native bindings need CUDA 13 CUBLAS libraries."
-      ensure_cuda13_cublas_runtime
     else
       break
     fi
@@ -264,7 +277,32 @@ modeling_path = custom_dir / "modeling_gemma4.py"
 init_path = custom_dir / "__init__.py"
 patch_url = os.environ["GEMMA4_PATCH_URL"]
 
-modeling_path.write_text(urlopen(patch_url).read().decode("utf-8"))
+modeling_text = urlopen(patch_url).read().decode("utf-8")
+# The pinned TensorRT-LLM 1.1.0 torch_moe op does not expose the newer
+# ActivationType-based act_fn argument expected by this upstream Gemma 4 patch.
+modeling_text = modeling_text.replace(
+    "from transformers import AutoConfig, PretrainedConfig, PreTrainedTokenizerFast\n",
+    "from transformers import AutoConfig, AutoModelForCausalLM, PretrainedConfig, PreTrainedTokenizerFast\n",
+)
+modeling_text = modeling_text.replace(
+    "from tensorrt_llm._torch.utils import ActivationType\n",
+    "",
+)
+modeling_text = modeling_text.replace(
+    "            is_gated_mlp=True,\n            act_fn=int(ActivationType.Gelu),\n",
+    "            is_gated_mlp=True,\n",
+)
+modeling_text = modeling_text.replace(
+    'AutoModelForCausalLMFactory.register_custom_model_cls("Gemma4TextConfig", Gemma4ForCausalLM)\n'
+    "Gemma4ForConditionalGenerationFactory.register_custom_model_cls(\n"
+    '    "Gemma4Config", Gemma4ForConditionalGeneration\n'
+    ")\n",
+    'AutoModelForCausalLM.register(Gemma4TextConfig, Gemma4ForCausalLM, exist_ok=True)\n'
+    "AutoModelForCausalLM.register(\n"
+    "    Gemma4Config, Gemma4ForConditionalGeneration, exist_ok=True\n"
+    ")\n",
+)
+modeling_path.write_text(modeling_text)
 
 init_text = init_path.read_text() if init_path.exists() else ""
 import_line = "from .modeling_gemma4 import Gemma4ForCausalLM, Gemma4ForConditionalGeneration\n"
@@ -295,21 +333,6 @@ PY
 
   rm -f "$support_error_log"
 }
-
-workflow_log "Verifying WSL2 CUDA and profiler tooling before Python-side installs."
-
-for required_cmd in nvidia-smi ncu nsys; do
-  if ! command -v "$required_cmd" >/dev/null 2>&1; then
-    workflow_log "Required command '$required_cmd' was not found in PATH."
-    workflow_log "This workflow avoids system-wide installation by default, so please install the missing Linux-side tool manually."
-    exit 1
-  fi
-done
-
-# Print the exact GPU and profiler details that the rest of the workflow will rely on.
-nvidia-smi --query-gpu=name,memory.total,driver_version,compute_cap --format=csv,noheader
-ncu --version
-nsys --version
 
 workflow_log "Verified the pinned Python dependency set inside $DL_ENV_ROOT."
 
