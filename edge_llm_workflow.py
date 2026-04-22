@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TensorRT Edge-LLM workflow entrypoints for Llama 3.1 8B on Thor."""
+"""TensorRT Edge-LLM workflow entrypoints for Llama 3.1 8B on DGX Spark / Thor."""
 
 from __future__ import annotations
 
@@ -33,8 +33,11 @@ REPORTS_DIR = ARTIFACTS_DIR / "reports"
 RUN_CONFIG_PATH = ARTIFACTS_DIR / "run_config.json"
 
 WORKFLOW_BACKEND = "tensorrt_edge_llm"
-WORKFLOW_ID = "llama31_edgellm_thor_fp16_v1"
-REQUESTED_MODEL_ID = "meta-llama/Llama-3.1-8B-Instruct"
+REQUESTED_MODEL_ID = os.environ.get(
+    "EDGE_LLM_MODEL_ID",
+    "RedHatAI/Llama-3.1-8B-Instruct",
+)
+WORKFLOW_ID = f"{REQUESTED_MODEL_ID.replace('/', '__').replace('.', '').lower()}_edgellm_dgxspark_fp16_v1"
 EXPORT_PRECISION = "FP16"
 DEFAULT_PROMPT = "How does a large language model work?"
 MODEL_SLUG = REQUESTED_MODEL_ID.replace("/", "__")
@@ -338,7 +341,7 @@ def export_root(config: Dict[str, Any]) -> Path:
 
 def bundle_path(config: Dict[str, Any]) -> Path:
     base = Path(config["artifacts"]["export_bundle_dir"])
-    return base / f"{MODEL_SLUG}__fp16.tar.gz"
+    return base / f"{MODEL_SLUG}__fp16.tar"
 
 
 def onnx_dir(config: Dict[str, Any]) -> Path:
@@ -949,11 +952,12 @@ def collect_python_info() -> Dict[str, Any]:
     }
 
 
-def ensure_x86_host() -> None:
+def ensure_host_export_platform() -> None:
     machine = platform.machine().lower()
-    if machine not in {"x86_64", "amd64"}:
+    if machine not in {"x86_64", "amd64", "aarch64", "arm64"}:
         fail(
-            "Host export requires an x86 Linux system with an NVIDIA GPU. "
+            "Host export requires Linux on a supported CPU architecture "
+            "(x86_64 or aarch64). "
             f"Detected machine architecture: {platform.machine()}"
         )
 
@@ -962,9 +966,16 @@ def ensure_aarch64_target() -> None:
     machine = platform.machine().lower()
     if machine not in {"aarch64", "arm64"}:
         fail(
-            "Target runtime preparation is intended for Jetson Thor (aarch64). "
+            "Target runtime preparation is intended for DGX Spark / Thor-class aarch64 systems. "
             f"Detected machine architecture: {platform.machine()}"
         )
+
+
+def detect_embedded_target() -> str:
+    gb10_target_dir = Path("/usr/local/cuda/n1/targets/aarch64-linux")
+    if gb10_target_dir.exists():
+        return "gb10"
+    return "jetson-thor"
 
 
 def ensure_module_import(module_name: str, install_hint: str) -> Any:
@@ -972,6 +983,25 @@ def ensure_module_import(module_name: str, install_hint: str) -> Any:
         return __import__(module_name)
     except ImportError as exc:
         fail(f"Missing Python dependency '{module_name}': {exc}. {install_hint}")
+
+
+def preferred_export_device() -> str:
+    try:
+        torch = ensure_module_import(
+            "torch",
+            "Install torch in the workflow virtual environment first.",
+        )
+    except WorkflowError:
+        return "cpu"
+
+    cuda = getattr(torch, "cuda", None)
+    if cuda is not None and callable(getattr(cuda, "is_available", None)):
+        try:
+            if bool(cuda.is_available()):
+                return "cuda"
+        except Exception:
+            pass
+    return "cpu"
 
 
 def ensure_hf_access(model_id: str) -> Dict[str, Any]:
@@ -1019,7 +1049,7 @@ def export_tool_path() -> str:
     if not path:
         fail(
             "The TensorRT Edge-LLM export tool `tensorrt-edgellm-export-llm` was not found in PATH. "
-            "Install the TensorRT Edge-LLM Python export pipeline on the x86 host first."
+            "Install the TensorRT Edge-LLM Python export pipeline in the workflow environment first."
         )
     return path
 
@@ -1216,12 +1246,10 @@ def prune_generated_tree(path: Path) -> None:
 
 def host_preflight_command(_: argparse.Namespace) -> int:
     config = load_run_config()
-    ensure_x86_host()
+    ensure_host_export_platform()
 
     hf_access = ensure_hf_access(REQUESTED_MODEL_ID)
     gpu_info = collect_gpu_info()
-    if not gpu_info.get("available"):
-        fail("Host export requires `nvidia-smi` and an NVIDIA GPU on the x86 host.")
 
     tool_path = export_tool_path()
 
@@ -1247,7 +1275,7 @@ def host_preflight_command(_: argparse.Namespace) -> int:
 
 def host_export_command(args: argparse.Namespace) -> int:
     config = load_run_config()
-    ensure_x86_host()
+    ensure_host_export_platform()
 
     hf_access = ensure_hf_access(REQUESTED_MODEL_ID)
     tool = export_tool_path()
@@ -1268,6 +1296,8 @@ def host_export_command(args: argparse.Namespace) -> int:
         REQUESTED_MODEL_ID,
         "--output_dir",
         str(model_onnx_dir),
+        "--device",
+        preferred_export_device(),
     ]
     run(export_cmd)
     manifest = validate_export_tree(config)
@@ -1308,7 +1338,7 @@ def host_package_export_command(_: argparse.Namespace) -> int:
     if output_bundle.exists():
         output_bundle.unlink()
 
-    with tarfile.open(output_bundle, "w:gz") as archive:
+    with tarfile.open(output_bundle, "w") as archive:
         archive.add(onnx_dir(config), arcname="onnx")
         archive.add(hf_assets_dir(config), arcname="hf_assets")
         archive.add(bundle_manifest_path(config), arcname="bundle_manifest.json")
@@ -1334,6 +1364,13 @@ def host_package_export_command(_: argparse.Namespace) -> int:
     return 0
 
 
+def default_bundle_source(config: Dict[str, Any]) -> str:
+    existing_bundle = config.get("host_export", {}).get("bundle_path")
+    if existing_bundle:
+        return str(existing_bundle)
+    return str(bundle_path(config))
+
+
 def target_preflight_command(args: argparse.Namespace) -> int:
     config = load_run_config()
     ensure_aarch64_target()
@@ -1352,6 +1389,7 @@ def target_preflight_command(args: argparse.Namespace) -> int:
     cmake_cache = build_dir / "CMakeCache.txt"
     toolchain_file = repo_root / "cmake" / "aarch64_linux_toolchain.cmake"
     trt_package_dir = os.environ.get("TRT_PACKAGE_DIR", "/usr")
+    embedded_target = detect_embedded_target()
 
     if args.force_reconfigure or not cmake_cache.exists():
         run(
@@ -1361,7 +1399,7 @@ def target_preflight_command(args: argparse.Namespace) -> int:
                 "-DCMAKE_BUILD_TYPE=Release",
                 f"-DTRT_PACKAGE_DIR={trt_package_dir}",
                 f"-DCMAKE_TOOLCHAIN_FILE={toolchain_file}",
-                "-DEMBEDDED_TARGET=jetson-thor",
+                f"-DEMBEDDED_TARGET={embedded_target}",
             ],
             cwd=build_dir,
         )
@@ -1391,6 +1429,7 @@ def target_preflight_command(args: argparse.Namespace) -> int:
         "llm_inference_path": str(llm_inference_path(repo_root)),
         "required_commands": required_commands,
         "trt_package_dir": trt_package_dir,
+        "embedded_target": embedded_target,
         "nvcc_version": nvcc_version,
         "tensorrt_packages": tensorrt_lines,
         "nv_tegra_release": tegra_release.read_text().strip() if tegra_release.exists() else None,
@@ -1427,12 +1466,49 @@ def target_fetch_export_command(args: argparse.Namespace) -> int:
     config = load_run_config()
     model_root = export_root(config)
     bundle_copy = bundle_path(config)
+    source = args.source or default_bundle_source(config)
+    source_path = Path(source).expanduser()
+
+    if source_path.exists():
+        try:
+            manifest = validate_export_tree(config)
+        except WorkflowError:
+            manifest = None
+        else:
+            checksum = sha256_file(source_path)
+            config["host_export"] = {
+                **config.get("host_export", {}),
+                "completed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "requested_model_id": REQUESTED_MODEL_ID,
+                "actual_model_id": REQUESTED_MODEL_ID,
+                "export_precision": EXPORT_PRECISION,
+                "source": source,
+                "bundle_path": str(source_path.resolve()),
+                "bundle_sha256": checksum,
+                "export_root": str(model_root),
+                "onnx_dir": str(onnx_dir(config)),
+                "hf_assets_dir": str(hf_assets_dir(config)),
+                "bundle_manifest_path": str(bundle_manifest_path(config)),
+                "manifest": manifest,
+                "reuse_existing_export_tree": True,
+            }
+            config.pop("engine_build", None)
+            config.pop("selected_runtime", None)
+            profiles = config.get("profiles")
+            if isinstance(profiles, dict):
+                profiles.clear()
+            reports = config.get("reports")
+            if isinstance(reports, dict):
+                reports.clear()
+            save_run_config(config)
+            print(json.dumps(config["host_export"], indent=2))
+            return 0
 
     if args.force:
         prune_generated_tree(model_root)
     model_root.mkdir(parents=True, exist_ok=True)
 
-    fetched_bundle = fetch_bundle_to_local_path(args.source, bundle_copy)
+    fetched_bundle = fetch_bundle_to_local_path(source, bundle_copy)
 
     for child in ("onnx", "hf_assets", "bundle_manifest.json"):
         target = model_root / child
@@ -1453,7 +1529,7 @@ def target_fetch_export_command(args: argparse.Namespace) -> int:
         "requested_model_id": REQUESTED_MODEL_ID,
         "actual_model_id": REQUESTED_MODEL_ID,
         "export_precision": EXPORT_PRECISION,
-        "source": args.source,
+        "source": source,
         "bundle_path": str(fetched_bundle),
         "bundle_sha256": checksum,
         "export_root": str(model_root),
@@ -1506,6 +1582,8 @@ def build_engine_command(args: argparse.Namespace) -> int:
     config = load_run_config()
     runtime_paths = ensure_target_binaries(config, args.repo_root)
     manifest = validate_export_tree(config)
+    repo_root = Path(runtime_paths["repo_root"])
+    plugin_path = repo_root / "build" / "libNvInfer_edgellm_plugin.so"
 
     build_config = copy.deepcopy(config["engine_build_config"])
     target_engine_dir = engine_dir(config)
@@ -1526,7 +1604,10 @@ def build_engine_command(args: argparse.Namespace) -> int:
         "--maxKVCacheCapacity",
         str(build_config["maxKVCacheCapacity"]),
     ]
-    run(cmd)
+    env = os.environ.copy()
+    if plugin_path.exists():
+        env["EDGELLM_PLUGIN_PATH"] = str(plugin_path)
+    run(cmd, cwd=repo_root, env=env)
 
     payload = {
         "completed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1537,6 +1618,7 @@ def build_engine_command(args: argparse.Namespace) -> int:
         "onnx_dir": str(onnx_dir(config)),
         "llm_build_path": runtime_paths["llm_build_path"],
         "llm_inference_path": runtime_paths["llm_inference_path"],
+        "edgellm_plugin_path": str(plugin_path) if plugin_path.exists() else None,
         "build_command": cmd,
         "engine_build_config": build_config,
         "manifest": manifest,
@@ -2012,7 +2094,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser(
         "host-preflight",
-        help="Validate x86 host export prerequisites and gated model access.",
+        help="Validate export prerequisites and gated model access on the current Linux machine.",
     )
 
     host_export = subparsers.add_parser(
@@ -2032,7 +2114,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     target_preflight = subparsers.add_parser(
         "target-preflight",
-        help="Validate the Thor target environment and build the local Edge-LLM C++ runtime.",
+        help="Validate the DGX Spark / Thor target environment and build the local Edge-LLM C++ runtime.",
     )
     target_preflight.add_argument("--repo-root", default=None)
     target_preflight.add_argument("--force-reconfigure", action="store_true")
@@ -2043,7 +2125,7 @@ def build_parser() -> argparse.ArgumentParser:
         "target-fetch-export",
         help="Fetch an exported ONNX bundle from an explicit local path or user@host:/abs/path source.",
     )
-    target_fetch.add_argument("--source", required=True)
+    target_fetch.add_argument("--source", default=None)
     target_fetch.add_argument("--force", action="store_true")
 
     build_engine = subparsers.add_parser(
