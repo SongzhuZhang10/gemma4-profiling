@@ -2,15 +2,15 @@
 
 set -euo pipefail
 
-source "$(cd "$(dirname "$0")" && pwd)/workflow_env.sh"
+source "$(cd "$(dirname "$0")" && pwd)/edge_llm_env.sh"
 
 ensure_workflow_dirs
 
 if [[ $# -ne 1 ]]; then
-  workflow_log "Usage: bash target_07_open_report.sh <report-path>"
+  workflow_log "Usage: bash 12_target_open_report.sh <report-path>"
   workflow_log "Examples:"
-  workflow_log "  bash target_07_open_report.sh artifacts/reports/prefill.ncu-rep"
-  workflow_log "  bash target_07_open_report.sh artifacts/reports/decode.nsys-rep"
+  workflow_log "  bash 12_target_open_report.sh artifacts/reports/prefill.ncu-rep"
+  workflow_log "  bash 12_target_open_report.sh artifacts/reports/decode.nsys-rep"
   exit 1
 fi
 

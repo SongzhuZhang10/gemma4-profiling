@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-source "$(cd "$(dirname "$0")" && pwd)/workflow_env.sh"
+source "$(cd "$(dirname "$0")" && pwd)/edge_llm_env.sh"
 
 ensure_selected_python_env
 require_python_env
@@ -25,4 +25,4 @@ else
   workflow_log "If the export tools are already available in PATH, the workflow will reuse them."
 fi
 
-"$PYTHON_BIN" "$WORKFLOW_ROOT/profiling_workflow.py" host-preflight "$@"
+"$PYTHON_BIN" "$WORKFLOW_ROOT/edge_llm_workflow.py" host-preflight "$@"

@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-source "$(cd "$(dirname "$0")" && pwd)/workflow_env.sh"
+source "$(cd "$(dirname "$0")" && pwd)/edge_llm_env.sh"
 
 ensure_selected_python_env
 require_python_env
@@ -22,4 +22,4 @@ if ! command -v cmake >/dev/null 2>&1; then
   "$PIP_BIN" install --upgrade 'cmake>=3.28,<4'
 fi
 
-"$PYTHON_BIN" "$WORKFLOW_ROOT/profiling_workflow.py" target-preflight "$@"
+"$PYTHON_BIN" "$WORKFLOW_ROOT/edge_llm_workflow.py" target-preflight "$@"
