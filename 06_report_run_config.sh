@@ -4,12 +4,5 @@ set -euo pipefail
 
 source "$(cd "$(dirname "$0")" && pwd)/workflow_env.sh"
 
-require_python_env
-ensure_workflow_dirs
-
-report_output="$REPORTS_DIR/run_config_summary.txt"
-
-# The Python helper is the single source of truth for the selected runtime and artifact manifest.
-"$PYTHON_BIN" "$WORKFLOW_ROOT/gemma4_workflow.py" report-config --output "$report_output"
-
-workflow_log "Saved run configuration summary to $report_output"
+workflow_log "06_report_run_config.sh is deprecated. Dispatching to target_06_report_run_config.sh."
+exec bash "$WORKFLOW_ROOT/target_06_report_run_config.sh" "$@"
