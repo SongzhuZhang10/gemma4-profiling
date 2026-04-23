@@ -9,8 +9,6 @@ ensure_workflow_dirs
 
 readonly DECODE_NCU_MINIMAL_METRICS="gpu__time_duration.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed,gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,sm__warps_active.avg.pct_of_peak_sustained_active"
 
-bash "$WORKFLOW_ROOT/09_target_trace_decode.sh"
-
 decode_ncu_stem="$REPORTS_DIR/decode"
 decode_ncu_report="$REPORTS_DIR/decode.ncu-rep"
 decode_metadata_json="$REPORTS_DIR/decode_ncu_run_metadata.json"
@@ -20,7 +18,7 @@ rm -f "$decode_ncu_report" "$decode_metadata_json"
 workflow_log "Capturing Nsight Compute profile for the decode workload."
 ncu \
   --target-processes all \
-  --replay-mode kernel \
+  --replay-mode application \
   --clock-control none \
   --metrics "$DECODE_NCU_MINIMAL_METRICS" \
   --disable-extra-suffixes \
@@ -40,7 +38,7 @@ fi
   --report "$decode_ncu_report" \
   --metadata "$decode_metadata_json" \
   --collection-backend tensorrt_edge_llm \
-  --replay-mode kernel \
+  --replay-mode application \
   --collection-profile minimal \
   --requested-max-new-tokens 128
 

@@ -45,7 +45,7 @@ EDGE_LLM_GIT_URL = "https://github.com/NVIDIA/TensorRT-Edge-LLM.git"
 
 ENGINE_BUILD_DEFAULTS = {
     "maxBatchSize": 1,
-    "maxInputLen": 1024,
+    "maxInputLen": 1280,
     "maxKVCacheCapacity": 4096,
     "precision": EXPORT_PRECISION,
 }
@@ -1634,6 +1634,9 @@ def build_engine_command(args: argparse.Namespace) -> int:
         "engine_dir": str(target_engine_dir),
         "llm_inference_path": runtime_paths["llm_inference_path"],
         "llm_build_path": runtime_paths["llm_build_path"],
+        "repo_root": str(repo_root),
+        "edgellm_plugin_path": str(plugin_path) if plugin_path.exists() else None,
+        "max_input_len": build_config["maxInputLen"],
     }
     save_run_config(config)
     print(json.dumps(payload, indent=2))
@@ -1824,6 +1827,16 @@ def run_inference_command(args: argparse.Namespace) -> int:
         input_metadata = copy.deepcopy(config["phase_workloads"][phase])
         save_run_config(config)
 
+        if phase == "prefill":
+            input_token_count = int(config["phase_workloads"][phase].get("input_token_count", 0))
+            max_input_len = int(runtime.get("max_input_len", 0))
+            if max_input_len > 0 and input_token_count > max_input_len:
+                fail(
+                    f"Prefill input token count ({input_token_count}) exceeds the engine's "
+                    f"maxInputLen ({max_input_len}). Rerun 06_target_build_engine.sh to rebuild "
+                    "the engine with a larger input length."
+                )
+
     output_path = Path(args.output_file).resolve() if args.output_file else runtime_output_path(config, phase)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1837,8 +1850,16 @@ def run_inference_command(args: argparse.Namespace) -> int:
         str(output_path),
     ]
 
+    repo_root_str = runtime.get("repo_root")
+    cwd = Path(str(repo_root_str)) if repo_root_str else None
+    plugin_path_str = runtime.get("edgellm_plugin_path")
+    env = os.environ.copy()
+    if plugin_path_str:
+        env["EDGELLM_PLUGIN_PATH"] = str(plugin_path_str)
+        log(f"Resolved Edge-LLM plugin path: {plugin_path_str}")
+
     started = time.time()
-    run(cmd)
+    run(cmd, cwd=cwd, env=env)
     elapsed = round(time.time() - started, 3)
 
     metadata = {

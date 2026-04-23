@@ -9,8 +9,6 @@ ensure_workflow_dirs
 
 readonly PREFILL_NCU_MINIMAL_METRICS="gpu__time_duration.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed,gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,sm__warps_active.avg.pct_of_peak_sustained_active"
 
-bash "$WORKFLOW_ROOT/07_target_trace_prefill.sh"
-
 prefill_ncu_stem="$REPORTS_DIR/prefill"
 prefill_ncu_report="$REPORTS_DIR/prefill.ncu-rep"
 prefill_metadata_json="$REPORTS_DIR/prefill_ncu_run_metadata.json"

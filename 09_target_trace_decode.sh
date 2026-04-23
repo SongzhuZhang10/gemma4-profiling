@@ -7,8 +7,6 @@ source "$(cd "$(dirname "$0")" && pwd)/edge_llm_env.sh"
 require_python_env
 ensure_workflow_dirs
 
-bash "$WORKFLOW_ROOT/06_target_build_engine.sh"
-
 decode_nsys_stem="$REPORTS_DIR/decode"
 decode_metadata_json="$REPORTS_DIR/decode_nsys_run_metadata.json"
 
