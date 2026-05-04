@@ -12,6 +12,8 @@ import json
 import os
 import platform
 import shutil
+import sqlite3
+import statistics
 import subprocess
 import sys
 import tarfile
@@ -66,9 +68,14 @@ PHASE_WORKLOAD_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "top_p": 1.0,
         "top_k": 50,
         "max_generate_length": 128,
-        "prompt_kind": "prepared_prompt",
+        "target_input_tokens": 1024,
+        "prompt_kind": "long_decode_context",
     },
 }
+
+BENCHMARK_REPEATS_DEFAULT = 5
+BENCHMARK_WARMUP_RUNS_DEFAULT = 1
+RUNTIME_PROFILE_STAGE_IDS = ("llm_prefill", "llm_generation")
 
 REQUIRED_TOKENIZER_FILES = ("config.json", "tokenizer_config.json")
 OPTIONAL_TOKENIZER_FILES = (
@@ -276,6 +283,14 @@ def normalize_phase_workloads(config: Dict[str, Any]) -> None:
         if phase not in normalized or not isinstance(payload, dict):
             continue
         deep_merge_in_place(normalized[phase], payload)
+
+    decode_payload = normalized.get("decode", {})
+    if (
+        isinstance(decode_payload, dict)
+        and int(decode_payload.get("target_input_tokens", 0) or 0) > 0
+        and decode_payload.get("prompt_kind") == "prepared_prompt"
+    ):
+        decode_payload["prompt_kind"] = "long_decode_context"
     config["phase_workloads"] = normalized
 
 
@@ -1724,9 +1739,9 @@ def build_phase_payload(
     tokenizer = load_tokenizer(config)
     base_prompt = prompt_override or config.get("workload", {}).get("prompt") or DEFAULT_PROMPT
 
-    if phase == "prefill":
-        target_tokens = int(phase_config.get("target_input_tokens", 1024))
-        messages, input_tokens = build_prefill_prompt(tokenizer, base_prompt, target_tokens)
+    target_tokens = phase_config.get("target_input_tokens")
+    if target_tokens is not None and int(target_tokens) > 0:
+        messages, input_tokens = build_prefill_prompt(tokenizer, base_prompt, int(target_tokens))
     else:
         messages = [{"role": "user", "content": base_prompt}]
         input_tokens = token_count_for_messages(tokenizer, messages)
@@ -1764,6 +1779,21 @@ def build_phase_payload(
     return payload
 
 
+def validate_phase_input_token_count(
+    runtime: Dict[str, Any],
+    phase: str,
+    input_metadata: Dict[str, Any],
+) -> None:
+    input_token_count = int(input_metadata.get("input_token_count", 0) or 0)
+    max_input_len = int(runtime.get("max_input_len", 0) or 0)
+    if max_input_len > 0 and input_token_count > max_input_len:
+        fail(
+            f"{phase.title()} input token count ({input_token_count}) exceeds the engine's "
+            f"maxInputLen ({max_input_len}). Rerun 06_target_build_engine.sh to rebuild "
+            "the engine with a larger input length."
+        )
+
+
 def load_selected_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
     runtime = config.get("selected_runtime")
     if not isinstance(runtime, dict):
@@ -1778,6 +1808,40 @@ def load_selected_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
     if not runtime_binary.exists():
         fail(f"Selected llm_inference binary does not exist: {runtime_binary}")
     return runtime
+
+
+def resolve_inference_input(
+    config: Dict[str, Any],
+    runtime: Dict[str, Any],
+    phase: str,
+    *,
+    input_file: Optional[str] = None,
+    prompt_override: Optional[str] = None,
+    max_generate_length_override: Optional[int] = None,
+) -> Tuple[Path, Dict[str, Any]]:
+    if input_file:
+        input_path = Path(input_file).resolve()
+        if not input_path.exists():
+            fail(f"Input JSON file was not found: {input_path}")
+        payload = read_json(input_path)
+        return input_path, {
+            "input_json": str(input_path),
+            "resolved_prompt_kind": "external_input_file",
+            "max_generate_length": payload.get("max_generate_length"),
+        }
+
+    payload = build_phase_payload(
+        config,
+        phase,
+        prompt_override=prompt_override,
+        max_generate_length_override=max_generate_length_override,
+    )
+    input_path = input_json_path(config, phase)
+    write_json(input_path, payload)
+    input_metadata = copy.deepcopy(config["phase_workloads"][phase])
+    save_run_config(config)
+    validate_phase_input_token_count(runtime, phase, input_metadata)
+    return input_path, input_metadata
 
 
 def extract_output_metadata(output_path: Path) -> Dict[str, Any]:
@@ -1797,47 +1861,128 @@ def extract_output_metadata(output_path: Path) -> Dict[str, Any]:
         requests = parsed.get("requests")
         if isinstance(requests, list):
             payload["request_count"] = len(requests)
+        responses = parsed.get("responses")
+        if isinstance(responses, list):
+            payload["response_count"] = len(responses)
     return payload
 
 
-def run_inference_command(args: argparse.Namespace) -> int:
-    config = load_run_config()
-    runtime = load_selected_runtime(config)
-    phase = args.phase
+def runtime_profile_stage_timings(runtime_profile: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    stages = runtime_profile.get("stages")
+    if not isinstance(stages, list):
+        return {}
 
-    if args.input_file:
-        input_path = Path(args.input_file).resolve()
-        if not input_path.exists():
-            fail(f"Input JSON file was not found: {input_path}")
-        payload = read_json(input_path)
-        input_metadata = {
-            "input_json": str(input_path),
-            "resolved_prompt_kind": "external_input_file",
-            "max_generate_length": payload.get("max_generate_length"),
+    stage_timings: Dict[str, Dict[str, Any]] = {}
+    for stage in stages:
+        if not isinstance(stage, dict):
+            continue
+        stage_id = stage.get("stage_id")
+        if not stage_id:
+            continue
+        stage_timings[str(stage_id)] = {
+            "total_runs": stage.get("total_runs"),
+            "total_gpu_time_ms": stage.get("total_gpu_time_ms"),
+            "average_time_per_run_ms": stage.get("average_time_per_run_ms"),
+            "gpu_time_stats": copy.deepcopy(stage.get("gpu_time_stats", {})),
         }
-    else:
-        payload = build_phase_payload(
-            config,
-            phase,
-            prompt_override=args.prompt,
-            max_generate_length_override=args.max_generate_length,
-        )
-        input_path = input_json_path(config, phase)
-        write_json(input_path, payload)
-        input_metadata = copy.deepcopy(config["phase_workloads"][phase])
-        save_run_config(config)
+    return stage_timings
 
-        if phase == "prefill":
-            input_token_count = int(config["phase_workloads"][phase].get("input_token_count", 0))
-            max_input_len = int(runtime.get("max_input_len", 0))
-            if max_input_len > 0 and input_token_count > max_input_len:
-                fail(
-                    f"Prefill input token count ({input_token_count}) exceeds the engine's "
-                    f"maxInputLen ({max_input_len}). Rerun 06_target_build_engine.sh to rebuild "
-                    "the engine with a larger input length."
-                )
 
-    output_path = Path(args.output_file).resolve() if args.output_file else runtime_output_path(config, phase)
+def runtime_profile_summary(runtime_profile: Dict[str, Any]) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {}
+    for key in ("prefill", "generation", "eagle_generation", "multimodal"):
+        section = runtime_profile.get(key)
+        if isinstance(section, dict):
+            summary[key] = copy.deepcopy(section)
+
+    for key in (
+        "peak_unified_memory_bytes",
+        "peak_unified_memory_mb",
+        "peak_gpu_memory_bytes",
+        "peak_gpu_memory_mb",
+        "peak_cpu_memory_bytes",
+        "peak_cpu_memory_mb",
+    ):
+        if key in runtime_profile:
+            summary[key] = runtime_profile.get(key)
+    return summary
+
+
+def infer_actual_output_token_count(
+    runtime_profile: Dict[str, Any],
+    requested_max_generate_length: Optional[Any],
+    output_exists: bool,
+) -> Optional[int]:
+    if not output_exists:
+        return None
+
+    generation = runtime_profile.get("generation")
+    generated_after_prefill = 0
+    if isinstance(generation, dict):
+        generated_after_prefill = int(generation.get("generated_tokens", 0) or 0)
+
+    if generated_after_prefill > 0:
+        return generated_after_prefill + 1
+
+    try:
+        max_generate_length = int(requested_max_generate_length)
+    except (TypeError, ValueError):
+        return None
+
+    if max_generate_length <= 0:
+        return 0
+    return 1
+
+
+def extract_runtime_profile_metadata(
+    runtime_profile_path: Optional[Path],
+    requested_max_generate_length: Optional[Any],
+    output_exists: bool,
+) -> Dict[str, Any]:
+    if runtime_profile_path is None:
+        return {}
+
+    metadata: Dict[str, Any] = {
+        "runtime_profile_json": str(runtime_profile_path),
+        "runtime_profile_exists": runtime_profile_path.exists(),
+    }
+    if not runtime_profile_path.exists():
+        return metadata
+
+    try:
+        runtime_profile = read_json(runtime_profile_path)
+    except json.JSONDecodeError:
+        metadata["runtime_profile_valid"] = False
+        return metadata
+
+    if not isinstance(runtime_profile, dict):
+        metadata["runtime_profile_valid"] = False
+        return metadata
+
+    metadata["runtime_profile_valid"] = True
+    metadata["runtime_profile_summary"] = runtime_profile_summary(runtime_profile)
+    metadata["runtime_profile_stage_timings"] = runtime_profile_stage_timings(runtime_profile)
+    metadata["actual_output_token_count"] = infer_actual_output_token_count(
+        runtime_profile,
+        requested_max_generate_length,
+        output_exists,
+    )
+    return metadata
+
+
+def execute_inference_run(
+    runtime: Dict[str, Any],
+    phase: str,
+    input_path: Path,
+    output_path: Path,
+    input_metadata: Dict[str, Any],
+    *,
+    warmup_runs: int = 0,
+    runtime_profile_output: Optional[Path] = None,
+) -> Dict[str, Any]:
+    if warmup_runs < 0:
+        fail("--warmup-runs must be non-negative.")
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     cmd = [
@@ -1849,6 +1994,17 @@ def run_inference_command(args: argparse.Namespace) -> int:
         "--outputFile",
         str(output_path),
     ]
+    if warmup_runs > 0:
+        cmd.extend(["--warmup", str(warmup_runs)])
+    if runtime_profile_output is not None:
+        runtime_profile_output.parent.mkdir(parents=True, exist_ok=True)
+        cmd.extend(
+            [
+                "--dumpProfile",
+                "--profileOutputFile",
+                str(runtime_profile_output),
+            ]
+        )
 
     repo_root_str = runtime.get("repo_root")
     cwd = Path(str(repo_root_str)) if repo_root_str else None
@@ -1866,9 +2022,9 @@ def run_inference_command(args: argparse.Namespace) -> int:
         "completed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "phase": phase,
         "workflow_backend": WORKFLOW_BACKEND,
-        "requested_model_id": REQUESTED_MODEL_ID,
-        "actual_model_id": REQUESTED_MODEL_ID,
-        "precision": EXPORT_PRECISION,
+        "requested_model_id": str(runtime.get("requested_model_id", REQUESTED_MODEL_ID)),
+        "actual_model_id": str(runtime.get("actual_model_id", REQUESTED_MODEL_ID)),
+        "precision": str(runtime.get("precision", EXPORT_PRECISION)),
         "engine_dir": str(runtime["engine_dir"]),
         "llm_inference_path": str(runtime["llm_inference_path"]),
         "input_file": str(input_path),
@@ -1877,8 +2033,44 @@ def run_inference_command(args: argparse.Namespace) -> int:
         "elapsed_seconds": elapsed,
         "requested_max_generate_length": input_metadata.get("max_generate_length"),
         "phase_workload": input_metadata,
+        "warmup_runs": int(warmup_runs),
     }
     metadata.update(extract_output_metadata(output_path))
+    metadata.update(
+        extract_runtime_profile_metadata(
+            runtime_profile_output,
+            input_metadata.get("max_generate_length"),
+            bool(metadata.get("output_exists")),
+        )
+    )
+    return metadata
+
+
+def run_inference_command(args: argparse.Namespace) -> int:
+    config = load_run_config()
+    runtime = load_selected_runtime(config)
+    phase = args.phase
+    input_path, input_metadata = resolve_inference_input(
+        config,
+        runtime,
+        phase,
+        input_file=args.input_file,
+        prompt_override=args.prompt,
+        max_generate_length_override=args.max_generate_length,
+    )
+    output_path = Path(args.output_file).resolve() if args.output_file else runtime_output_path(config, phase)
+    runtime_profile_output = (
+        Path(args.runtime_profile_output).resolve() if args.runtime_profile_output else None
+    )
+    metadata = execute_inference_run(
+        runtime,
+        phase,
+        input_path,
+        output_path,
+        input_metadata,
+        warmup_runs=args.warmup_runs,
+        runtime_profile_output=runtime_profile_output,
+    )
 
     if args.metadata_output:
         write_json(Path(args.metadata_output).resolve(), metadata)
@@ -1889,7 +2081,247 @@ def run_inference_command(args: argparse.Namespace) -> int:
     phase_profile = profiles.setdefault(phase, {})
     phase_profile["last_output_json"] = str(output_path)
     phase_profile["last_runtime_metadata"] = metadata
+    if metadata.get("runtime_profile_json"):
+        phase_profile["last_runtime_profile_json"] = str(metadata["runtime_profile_json"])
     save_run_config(config)
+    return 0
+
+
+def percentile_value(values: Sequence[float], percentile: float) -> Optional[float]:
+    if not values:
+        return None
+    sorted_values = sorted(float(value) for value in values)
+    index = min(int(len(sorted_values) * percentile), len(sorted_values) - 1)
+    return sorted_values[index]
+
+
+def numeric_series_stats(values: Sequence[float]) -> Dict[str, Any]:
+    if not values:
+        return {"count": 0}
+
+    normalized = [float(value) for value in values]
+    return {
+        "count": len(normalized),
+        "min": min(normalized),
+        "max": max(normalized),
+        "mean": statistics.fmean(normalized),
+        "median": statistics.median(normalized),
+        "p95": percentile_value(normalized, 0.95),
+        "p99": percentile_value(normalized, 0.99),
+        "stddev": statistics.pstdev(normalized) if len(normalized) > 1 else 0.0,
+    }
+
+
+def benchmark_output_path(config: Dict[str, Any], phase: str, run_index: int) -> Path:
+    return Path(config["artifacts"]["runtime_dir"]) / MODEL_SLUG / f"{phase}_benchmark_run_{run_index:02d}_output.json"
+
+
+def benchmark_runtime_profile_path(config: Dict[str, Any], phase: str, run_index: int) -> Path:
+    return runtime_metadata_path(config, phase, f"benchmark_run_{run_index:02d}_runtime_profile")
+
+
+def benchmark_metadata_path(config: Dict[str, Any], phase: str, run_index: int) -> Path:
+    return runtime_metadata_path(config, phase, f"benchmark_run_{run_index:02d}_metadata")
+
+
+def benchmark_summary_path(config: Dict[str, Any], phase: str) -> Path:
+    return runtime_metadata_path(config, phase, "benchmark_summary")
+
+
+def runtime_profile_section_from_metadata(
+    metadata: Dict[str, Any],
+    section_name: str,
+) -> Optional[Dict[str, Any]]:
+    runtime_profile_summary_payload = metadata.get("runtime_profile_summary")
+    if not isinstance(runtime_profile_summary_payload, dict):
+        return None
+    section = runtime_profile_summary_payload.get(section_name)
+    if not isinstance(section, dict):
+        return None
+    return section
+
+
+def runtime_stage_from_metadata(
+    metadata: Dict[str, Any],
+    stage_id: str,
+) -> Optional[Dict[str, Any]]:
+    stage_timings = metadata.get("runtime_profile_stage_timings")
+    if not isinstance(stage_timings, dict):
+        return None
+    stage = stage_timings.get(stage_id)
+    if not isinstance(stage, dict):
+        return None
+    return stage
+
+
+def build_benchmark_section_summary(
+    run_metadata: Sequence[Dict[str, Any]],
+    section_name: str,
+    stage_id: str,
+    metric_names: Sequence[str],
+) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {
+        "present_in_runs": 0,
+        "metrics": {},
+    }
+
+    for metadata in run_metadata:
+        if runtime_profile_section_from_metadata(metadata, section_name):
+            summary["present_in_runs"] += 1
+
+    for metric_name in metric_names:
+        values: List[float] = []
+        for metadata in run_metadata:
+            section = runtime_profile_section_from_metadata(metadata, section_name)
+            if not section:
+                continue
+            value = section.get(metric_name)
+            if isinstance(value, (int, float)):
+                values.append(float(value))
+        if values:
+            summary["metrics"][metric_name] = numeric_series_stats(values)
+
+    for metric_name in ("total_gpu_time_ms", "average_time_per_run_ms"):
+        values = []
+        for metadata in run_metadata:
+            stage = runtime_stage_from_metadata(metadata, stage_id)
+            if not stage:
+                continue
+            value = stage.get(metric_name)
+            if isinstance(value, (int, float)):
+                values.append(float(value))
+        if values:
+            summary["metrics"][f"stage_{metric_name}"] = numeric_series_stats(values)
+
+    return summary
+
+
+def benchmark_phase_command(args: argparse.Namespace) -> int:
+    if args.repeats <= 0:
+        fail("--repeats must be positive.")
+    if args.warmup_runs < 0:
+        fail("--warmup-runs must be non-negative.")
+
+    config = load_run_config()
+    runtime = load_selected_runtime(config)
+    phase = args.phase
+    input_path, input_metadata = resolve_inference_input(
+        config,
+        runtime,
+        phase,
+        prompt_override=args.prompt,
+        max_generate_length_override=args.max_generate_length,
+    )
+
+    collected_metadata: List[Dict[str, Any]] = []
+    run_summaries: List[Dict[str, Any]] = []
+    for run_index in range(1, args.repeats + 1):
+        output_path = benchmark_output_path(config, phase, run_index)
+        runtime_profile_path = benchmark_runtime_profile_path(config, phase, run_index)
+        metadata_path = benchmark_metadata_path(config, phase, run_index)
+
+        metadata = execute_inference_run(
+            runtime,
+            phase,
+            input_path,
+            output_path,
+            input_metadata,
+            warmup_runs=args.warmup_runs,
+            runtime_profile_output=runtime_profile_path,
+        )
+        if not metadata.get("runtime_profile_valid"):
+            fail(
+                f"Benchmark run {run_index} did not produce a valid runtime profile at "
+                f"{runtime_profile_path}."
+            )
+
+        write_json(metadata_path, metadata)
+        collected_metadata.append(metadata)
+        run_summaries.append(
+            {
+                "run_index": run_index,
+                "metadata_json": str(metadata_path),
+                "runtime_profile_json": metadata.get("runtime_profile_json"),
+                "output_file": metadata.get("output_file"),
+                "elapsed_seconds": metadata.get("elapsed_seconds"),
+                "actual_output_token_count": metadata.get("actual_output_token_count"),
+                "prefill": copy.deepcopy(runtime_profile_section_from_metadata(metadata, "prefill")),
+                "generation": copy.deepcopy(runtime_profile_section_from_metadata(metadata, "generation")),
+                "runtime_profile_stage_timings": copy.deepcopy(
+                    metadata.get("runtime_profile_stage_timings", {})
+                ),
+            }
+        )
+
+    benchmark_summary = {
+        "phase": phase,
+        "workflow_backend": WORKFLOW_BACKEND,
+        "workflow_id": WORKFLOW_ID,
+        "requested_model_id": str(runtime.get("requested_model_id", REQUESTED_MODEL_ID)),
+        "actual_model_id": str(runtime.get("actual_model_id", REQUESTED_MODEL_ID)),
+        "precision": str(runtime.get("precision", EXPORT_PRECISION)),
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "repeats": int(args.repeats),
+        "warmup_runs": int(args.warmup_runs),
+        "input_file": str(input_path),
+        "phase_workload": copy.deepcopy(input_metadata),
+        "runs": run_summaries,
+        "summary": {
+            "prefill": build_benchmark_section_summary(
+                collected_metadata,
+                "prefill",
+                "llm_prefill",
+                (
+                    "reused_tokens",
+                    "computed_tokens",
+                    "average_tokens_per_run",
+                    "average_time_per_run_ms",
+                    "tokens_per_second",
+                    "average_time_per_token_ms",
+                ),
+            ),
+            "generation": build_benchmark_section_summary(
+                collected_metadata,
+                "generation",
+                "llm_generation",
+                (
+                    "generated_tokens",
+                    "average_tokens_per_run",
+                    "tokens_per_second",
+                    "average_time_per_token_ms",
+                ),
+            ),
+            "actual_output_token_count": numeric_series_stats(
+                [
+                    float(metadata["actual_output_token_count"])
+                    for metadata in collected_metadata
+                    if metadata.get("actual_output_token_count") is not None
+                ]
+            ),
+        },
+    }
+
+    summary_path = benchmark_summary_path(config, phase)
+    write_json(summary_path, benchmark_summary)
+
+    profiles = config.setdefault("profiles", {})
+    phase_profile = profiles.setdefault(phase, {})
+    phase_profile["benchmark_summary_json"] = str(summary_path)
+    phase_profile["benchmark_repeats"] = int(args.repeats)
+    phase_profile["benchmark_warmup_runs"] = int(args.warmup_runs)
+    phase_profile["benchmark_runtime_profile_jsons"] = [
+        str(metadata.get("runtime_profile_json"))
+        for metadata in collected_metadata
+        if metadata.get("runtime_profile_json")
+    ]
+    phase_profile["benchmark_metadata_jsons"] = [str(run["metadata_json"]) for run in run_summaries]
+    phase_profile["last_runtime_metadata"] = collected_metadata[-1]
+    phase_profile["last_output_json"] = str(collected_metadata[-1]["output_file"])
+    if collected_metadata[-1].get("runtime_profile_json"):
+        phase_profile["last_runtime_profile_json"] = str(collected_metadata[-1]["runtime_profile_json"])
+    save_run_config(config)
+
+    log(f"Saved {phase} benchmark summary to {summary_path}")
     return 0
 
 
@@ -1916,6 +2348,174 @@ def export_nsys_sqlite(report_path: Path) -> Path:
     fail(f"Expected exported SQLite report was not created at {sqlite_path} or {sqlite_prefix}")
 
 
+def sqlite_table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
+    row = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def summarize_nsys_sqlite(sqlite_path: Path, top_limit: int = 20) -> Dict[str, Any]:
+    with sqlite3.connect(str(sqlite_path)) as connection:
+        connection.row_factory = sqlite3.Row
+
+        def sum_duration_ns(table_name: str) -> int:
+            if not sqlite_table_exists(connection, table_name):
+                return 0
+            row = connection.execute(
+                f"SELECT COALESCE(SUM(end - start), 0) AS total_ns FROM {table_name}"
+            ).fetchone()
+            return int(row["total_ns"] or 0) if row else 0
+
+        def count_rows(table_name: str) -> int:
+            if not sqlite_table_exists(connection, table_name):
+                return 0
+            row = connection.execute(f"SELECT COUNT(*) AS count FROM {table_name}").fetchone()
+            return int(row["count"] or 0) if row else 0
+
+        top_kernels: List[Dict[str, Any]] = []
+        if sqlite_table_exists(connection, "CUPTI_ACTIVITY_KIND_KERNEL"):
+            rows = connection.execute(
+                """
+                SELECT
+                    COALESCE(demangled.value, short_name.value, '<unknown>') AS kernel_name,
+                    COUNT(*) AS launch_count,
+                    SUM(kernel.end - kernel.start) AS total_duration_ns,
+                    AVG(kernel.end - kernel.start) AS avg_duration_ns,
+                    MAX(kernel.end - kernel.start) AS max_duration_ns
+                FROM CUPTI_ACTIVITY_KIND_KERNEL AS kernel
+                LEFT JOIN StringIds AS demangled ON kernel.demangledName = demangled.id
+                LEFT JOIN StringIds AS short_name ON kernel.shortName = short_name.id
+                GROUP BY kernel_name
+                ORDER BY total_duration_ns DESC
+                LIMIT ?
+                """,
+                (top_limit,),
+            ).fetchall()
+            for row in rows:
+                total_duration_ns = int(row["total_duration_ns"] or 0)
+                avg_duration_ns = float(row["avg_duration_ns"] or 0.0)
+                max_duration_ns = int(row["max_duration_ns"] or 0)
+                top_kernels.append(
+                    {
+                        "kernel_name": str(row["kernel_name"]),
+                        "launch_count": int(row["launch_count"] or 0),
+                        "total_duration_ns": total_duration_ns,
+                        "total_duration_ms": total_duration_ns / 1_000_000.0,
+                        "avg_duration_ns": avg_duration_ns,
+                        "avg_duration_ms": avg_duration_ns / 1_000_000.0,
+                        "max_duration_ns": max_duration_ns,
+                        "max_duration_ms": max_duration_ns / 1_000_000.0,
+                    }
+                )
+
+        top_memcpy: List[Dict[str, Any]] = []
+        if sqlite_table_exists(connection, "CUPTI_ACTIVITY_KIND_MEMCPY"):
+            rows = connection.execute(
+                """
+                SELECT
+                    memcpy.start AS start_ns,
+                    memcpy.end AS end_ns,
+                    (memcpy.end - memcpy.start) AS duration_ns,
+                    memcpy.bytes AS bytes,
+                    memcpy.streamId AS stream_id,
+                    memcpy.contextId AS context_id,
+                    COALESCE(copy_kind.label, CAST(memcpy.copyKind AS TEXT)) AS copy_kind
+                FROM CUPTI_ACTIVITY_KIND_MEMCPY AS memcpy
+                LEFT JOIN ENUM_CUDA_MEMCPY_OPER AS copy_kind ON memcpy.copyKind = copy_kind.id
+                ORDER BY duration_ns DESC
+                LIMIT ?
+                """,
+                (top_limit,),
+            ).fetchall()
+            for row in rows:
+                duration_ns = int(row["duration_ns"] or 0)
+                byte_count = int(row["bytes"] or 0)
+                throughput_mb_per_s = (
+                    (byte_count / 1_000_000.0) / (duration_ns / 1_000_000_000.0)
+                    if duration_ns > 0
+                    else 0.0
+                )
+                top_memcpy.append(
+                    {
+                        "copy_kind": str(row["copy_kind"]),
+                        "bytes": byte_count,
+                        "duration_ns": duration_ns,
+                        "duration_ms": duration_ns / 1_000_000.0,
+                        "throughput_mb_per_s": throughput_mb_per_s,
+                        "stream_id": int(row["stream_id"] or 0),
+                        "context_id": int(row["context_id"] or 0),
+                        "start_ns": int(row["start_ns"] or 0),
+                        "end_ns": int(row["end_ns"] or 0),
+                    }
+                )
+
+        top_memset: List[Dict[str, Any]] = []
+        if sqlite_table_exists(connection, "CUPTI_ACTIVITY_KIND_MEMSET"):
+            rows = connection.execute(
+                """
+                SELECT
+                    memset.start AS start_ns,
+                    memset.end AS end_ns,
+                    (memset.end - memset.start) AS duration_ns,
+                    memset.bytes AS bytes,
+                    memset.value AS value,
+                    memset.streamId AS stream_id,
+                    memset.contextId AS context_id
+                FROM CUPTI_ACTIVITY_KIND_MEMSET AS memset
+                ORDER BY duration_ns DESC
+                LIMIT ?
+                """,
+                (top_limit,),
+            ).fetchall()
+            for row in rows:
+                duration_ns = int(row["duration_ns"] or 0)
+                byte_count = int(row["bytes"] or 0)
+                throughput_mb_per_s = (
+                    (byte_count / 1_000_000.0) / (duration_ns / 1_000_000_000.0)
+                    if duration_ns > 0
+                    else 0.0
+                )
+                top_memset.append(
+                    {
+                        "bytes": byte_count,
+                        "value": int(row["value"] or 0),
+                        "duration_ns": duration_ns,
+                        "duration_ms": duration_ns / 1_000_000.0,
+                        "throughput_mb_per_s": throughput_mb_per_s,
+                        "stream_id": int(row["stream_id"] or 0),
+                        "context_id": int(row["context_id"] or 0),
+                        "start_ns": int(row["start_ns"] or 0),
+                        "end_ns": int(row["end_ns"] or 0),
+                    }
+                )
+
+        kernel_total_ns = sum_duration_ns("CUPTI_ACTIVITY_KIND_KERNEL")
+        memcpy_total_ns = sum_duration_ns("CUPTI_ACTIVITY_KIND_MEMCPY")
+        memset_total_ns = sum_duration_ns("CUPTI_ACTIVITY_KIND_MEMSET")
+        total_gpu_activity_ns = kernel_total_ns + memcpy_total_ns + memset_total_ns
+
+        return {
+            "gpu_activity": {
+                "kernel_launch_count": count_rows("CUPTI_ACTIVITY_KIND_KERNEL"),
+                "memcpy_count": count_rows("CUPTI_ACTIVITY_KIND_MEMCPY"),
+                "memset_count": count_rows("CUPTI_ACTIVITY_KIND_MEMSET"),
+                "total_kernel_gpu_time_ns": kernel_total_ns,
+                "total_kernel_gpu_time_ms": kernel_total_ns / 1_000_000.0,
+                "total_memcpy_gpu_time_ns": memcpy_total_ns,
+                "total_memcpy_gpu_time_ms": memcpy_total_ns / 1_000_000.0,
+                "total_memset_gpu_time_ns": memset_total_ns,
+                "total_memset_gpu_time_ms": memset_total_ns / 1_000_000.0,
+                "total_captured_gpu_time_ns": total_gpu_activity_ns,
+                "total_captured_gpu_time_ms": total_gpu_activity_ns / 1_000_000.0,
+            },
+            "top_kernels": top_kernels,
+            "top_memcpy": top_memcpy,
+            "top_memset": top_memset,
+        }
+
+
 def summarize_nsys_command(args: argparse.Namespace) -> int:
     config = load_run_config()
     runtime = load_selected_runtime(config)
@@ -1925,6 +2525,7 @@ def summarize_nsys_command(args: argparse.Namespace) -> int:
 
     sqlite_path = export_nsys_sqlite(report_path)
     phase_workload = copy.deepcopy(config["phase_workloads"][args.phase])
+    nsys_activity_summary = summarize_nsys_sqlite(sqlite_path)
     summary = {
         "phase": args.phase,
         "workflow_backend": WORKFLOW_BACKEND,
@@ -1935,6 +2536,7 @@ def summarize_nsys_command(args: argparse.Namespace) -> int:
         "report_path": str(report_path),
         "sqlite_path": str(sqlite_path),
         "phase_workload": phase_workload,
+        "nsys_activity_summary": nsys_activity_summary,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -1949,6 +2551,7 @@ def summarize_nsys_command(args: argparse.Namespace) -> int:
             "nsys_sqlite": str(sqlite_path),
             "summary_json": str(summary_path),
             "phase_definition": phase_workload,
+            "nsys_activity_summary": nsys_activity_summary,
         }
     )
     save_run_config(config)
@@ -1963,6 +2566,7 @@ def register_ncu_command(args: argparse.Namespace) -> int:
     phase_profile = profiles.setdefault(args.phase, {})
     report_path = Path(args.report).resolve()
     metadata_path = Path(args.metadata).resolve() if args.metadata else None
+    runtime_profile_path = Path(args.runtime_profile).resolve() if args.runtime_profile else None
 
     if not report_path.exists():
         fail(f"Nsight Compute report was not found: {report_path}")
@@ -1986,10 +2590,13 @@ def register_ncu_command(args: argparse.Namespace) -> int:
         metadata_payload["collection_backend"] = args.collection_backend
         metadata_payload["replay_mode"] = args.replay_mode
         metadata_payload["collection_profile"] = args.collection_profile
+        metadata_payload["phase_filter"] = args.phase_filter
         metadata_payload["requested_max_generate_length"] = requested_max_new_tokens
         metadata_payload["actual_output_token_count"] = actual_output_token_count
         metadata_payload["report_created_at"] = registered_at
         metadata_payload["ncu_summary"] = ncu_summary
+        if runtime_profile_path is not None:
+            metadata_payload["runtime_profile_json"] = str(runtime_profile_path)
         write_json(metadata_path, metadata_payload)
 
     phase_profile["ncu_rep"] = str(report_path)
@@ -1997,11 +2604,14 @@ def register_ncu_command(args: argparse.Namespace) -> int:
     phase_profile["ncu_collection_backend"] = args.collection_backend
     phase_profile["ncu_replay_mode"] = args.replay_mode
     phase_profile["ncu_collection_profile"] = args.collection_profile
+    phase_profile["ncu_phase_filter"] = args.phase_filter
     phase_profile["ncu_requested_max_generate_length"] = requested_max_new_tokens
     phase_profile["ncu_actual_output_token_count"] = actual_output_token_count
     phase_profile["ncu_summary"] = ncu_summary
     if metadata_path:
         phase_profile["ncu_metadata_json"] = str(metadata_path)
+    if runtime_profile_path is not None:
+        phase_profile["ncu_runtime_profile_json"] = str(runtime_profile_path)
 
     save_run_config(config)
     return 0
@@ -2166,6 +2776,18 @@ def build_parser() -> argparse.ArgumentParser:
     run_inference.add_argument("--metadata-output", default=None)
     run_inference.add_argument("--max-generate-length", type=int, default=None)
     run_inference.add_argument("--prompt", default=None)
+    run_inference.add_argument("--warmup-runs", type=int, default=0)
+    run_inference.add_argument("--runtime-profile-output", default=None)
+
+    benchmark_phase = subparsers.add_parser(
+        "benchmark-phase",
+        help="Run repeated llm_inference measurements with native phase metrics.",
+    )
+    benchmark_phase.add_argument("--phase", choices=["prefill", "decode"], default="decode")
+    benchmark_phase.add_argument("--repeats", type=int, default=BENCHMARK_REPEATS_DEFAULT)
+    benchmark_phase.add_argument("--warmup-runs", type=int, default=BENCHMARK_WARMUP_RUNS_DEFAULT)
+    benchmark_phase.add_argument("--max-generate-length", type=int, default=None)
+    benchmark_phase.add_argument("--prompt", default=None)
 
     summarize_nsys = subparsers.add_parser(
         "summarize-nsys",
@@ -2185,6 +2807,8 @@ def build_parser() -> argparse.ArgumentParser:
     register_ncu.add_argument("--replay-mode", required=True)
     register_ncu.add_argument("--collection-profile", required=True)
     register_ncu.add_argument("--requested-max-new-tokens", type=int, default=None)
+    register_ncu.add_argument("--phase-filter", default=None)
+    register_ncu.add_argument("--runtime-profile", default=None)
 
     inspect_ncu = subparsers.add_parser(
         "inspect-ncu",
@@ -2237,6 +2861,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return build_engine_command(args)
         if args.command == "run-inference":
             return run_inference_command(args)
+        if args.command == "benchmark-phase":
+            return benchmark_phase_command(args)
         if args.command == "summarize-nsys":
             return summarize_nsys_command(args)
         if args.command == "register-ncu":
