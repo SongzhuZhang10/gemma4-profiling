@@ -7,7 +7,7 @@ source "$(cd "$(dirname "$0")" && pwd)/edge_llm_env.sh"
 require_python_env
 ensure_workflow_dirs
 
-readonly DECODE_NCU_MINIMAL_METRICS="gpu__time_duration.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed,gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,sm__warps_active.avg.pct_of_peak_sustained_active"
+readonly DECODE_NCU_MINIMAL_METRICS="gpu__time_duration.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed,gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"
 
 decode_ncu_stem="$REPORTS_DIR/decode"
 decode_ncu_report="$REPORTS_DIR/decode.ncu-rep"
@@ -21,7 +21,7 @@ workflow_log "Capturing Nsight Compute profile for the decode workload."
 ncu \
   --target-processes all \
   --nvtx \
-  --nvtx-include "LLM_GENERATION" \
+  --nvtx-include "LLM_GENERATION/" \
   --clock-control none \
   --cache-control=all \
   --replay-mode application \
@@ -31,6 +31,7 @@ ncu \
   -o "$decode_ncu_stem" \
   "$PYTHON_BIN" "$WORKFLOW_ROOT/edge_llm_workflow.py" run-inference \
   --phase decode \
+  --max-generate-length 128 \
   --metadata-output "$decode_metadata_json" \
   --runtime-profile-output "$decode_runtime_profile_json"
 
@@ -46,7 +47,7 @@ fi
   --collection-backend tensorrt_edge_llm \
   --replay-mode application \
   --collection-profile minimal \
-  --phase-filter LLM_GENERATION \
+  --phase-filter LLM_GENERATION/ \
   --runtime-profile "$decode_runtime_profile_json" \
   --requested-max-new-tokens 128
 

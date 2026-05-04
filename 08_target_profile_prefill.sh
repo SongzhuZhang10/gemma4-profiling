@@ -7,7 +7,7 @@ source "$(cd "$(dirname "$0")" && pwd)/edge_llm_env.sh"
 require_python_env
 ensure_workflow_dirs
 
-readonly PREFILL_NCU_MINIMAL_METRICS="gpu__time_duration.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed,gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,sm__warps_active.avg.pct_of_peak_sustained_active"
+readonly PREFILL_NCU_MINIMAL_METRICS="gpu__time_duration.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed,gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"
 
 prefill_ncu_stem="$REPORTS_DIR/prefill"
 prefill_ncu_report="$REPORTS_DIR/prefill.ncu-rep"
@@ -20,7 +20,7 @@ workflow_log "Capturing Nsight Compute profile for the prefill workload."
 ncu \
   --target-processes all \
   --nvtx \
-  --nvtx-include "LLM_PREFILL" \
+  --nvtx-include "LLM_PREFILL/" \
   --replay-mode kernel \
   --clock-control none \
   --metrics "$PREFILL_NCU_MINIMAL_METRICS" \
@@ -29,6 +29,7 @@ ncu \
   -o "$prefill_ncu_stem" \
   "$PYTHON_BIN" "$WORKFLOW_ROOT/edge_llm_workflow.py" run-inference \
   --phase prefill \
+  --max-generate-length 1 \
   --metadata-output "$prefill_metadata_json" \
   --runtime-profile-output "$prefill_runtime_profile_json"
 
@@ -44,7 +45,7 @@ fi
   --collection-backend tensorrt_edge_llm \
   --replay-mode kernel \
   --collection-profile minimal \
-  --phase-filter LLM_PREFILL \
+  --phase-filter LLM_PREFILL/ \
   --runtime-profile "$prefill_runtime_profile_json" \
   --requested-max-new-tokens 1
 

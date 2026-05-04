@@ -10,8 +10,8 @@ ensure_workflow_dirs
 ensure_vscode_settings
 
 workflow_log "Installing host-side Python dependencies for the TensorRT Edge-LLM export workflow."
-"$PIP_BIN" install --upgrade pip 'setuptools<80' 'wheel<=0.45.1'
-"$PIP_BIN" install --upgrade \
+run_pip install --upgrade pip 'setuptools<80' 'wheel<=0.45.1'
+run_pip install --upgrade \
   'numpy<2' \
   'pandas>=2.1,<2.2' \
   huggingface_hub==0.36.2 \
@@ -25,7 +25,7 @@ workflow_log "Installing host-side Python dependencies for the TensorRT Edge-LLM
 
 if [[ -d "$EDGE_LLM_REPO_DIR" ]]; then
   workflow_log "Installing TensorRT Edge-LLM export tools from $EDGE_LLM_REPO_DIR."
-  "$PIP_BIN" install --upgrade --no-deps -e "$EDGE_LLM_REPO_DIR"
+  run_pip install --upgrade --no-deps -e "$EDGE_LLM_REPO_DIR"
 else
   workflow_log "TensorRT Edge-LLM repo not found at $EDGE_LLM_REPO_DIR."
   workflow_log "If the export tools are already available in PATH, the workflow will reuse them."

@@ -103,12 +103,19 @@ COPY_KERNEL_TOKENS = (
     "bfloat16_copy_kernel_cuda",
 )
 
+NCU_MEMORY_THROUGHPUT_METRIC = (
+    "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"
+)
+NCU_LEGACY_MEMORY_THROUGHPUT_METRIC = (
+    "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed"
+)
+NCU_SLICE_CACHE_VERSION = 3
+
 NCU_SLICE_METRICS = ",".join(
     (
         "gpu__time_duration.sum",
         "sm__throughput.avg.pct_of_peak_sustained_elapsed",
-        "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed",
-        "sm__warps_active.avg.pct_of_peak_sustained_active",
+        NCU_MEMORY_THROUGHPUT_METRIC,
     )
 )
 
@@ -117,8 +124,11 @@ NCU_METRIC_ALIASES = {
     "Duration": "duration_ns",
     "sm__throughput.avg.pct_of_peak_sustained_elapsed": "sm_pct",
     "Compute (SM) Throughput": "sm_pct",
-    "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": "dram_pct",
-    "DRAM Throughput": "dram_pct",
+    NCU_MEMORY_THROUGHPUT_METRIC: "mem_pct",
+    NCU_LEGACY_MEMORY_THROUGHPUT_METRIC: "mem_pct",
+    "Compute Memory Pipeline Throughput": "mem_pct",
+    "Compute Memory Throughput": "mem_pct",
+    "DRAM Throughput": "mem_pct",
     "sm__warps_active.avg.pct_of_peak_sustained_active": "warps_pct",
     "Achieved Occupancy": "warps_pct",
 }
@@ -207,6 +217,26 @@ def write_json(path: Path, payload: Dict[str, Any]) -> None:
 
 def command_path(name: str) -> Optional[str]:
     return shutil.which(name)
+
+
+def cmake_cache_value(cache_path: Path, key: str) -> Optional[str]:
+    if not cache_path.exists():
+        return None
+
+    prefix = f"{key}:"
+    for line in cache_path.read_text().splitlines():
+        if not line.startswith(prefix):
+            continue
+        _, _, value = line.partition("=")
+        return value.strip() or None
+    return None
+
+
+def cmake_cache_bool(cache_path: Path, key: str) -> Optional[bool]:
+    value = cmake_cache_value(cache_path, key)
+    if value is None:
+        return None
+    return value.upper() in {"1", "ON", "TRUE", "YES", "Y"}
 
 
 def default_edge_llm_repo_root() -> Path:
@@ -494,6 +524,19 @@ def average_or_none(total: float, count: int) -> Optional[float]:
     return total / count
 
 
+def ncu_cache_metric_value(
+    row: Dict[str, Any],
+    primary_key: str,
+    legacy_key: Optional[str] = None,
+) -> Optional[float]:
+    value = row.get(primary_key)
+    if value is None and legacy_key is not None:
+        value = row.get(legacy_key)
+    if value is None:
+        return None
+    return float(value)
+
+
 def classify_kernel_family(kernel_name: str) -> str:
     lowered = kernel_name.lower()
     if any(token in lowered for token in SAMPLING_KERNEL_TOKENS):
@@ -639,7 +682,7 @@ def build_ncu_slice_cache(report_path: Path) -> Dict[str, Any]:
                 "grid_size": row.get("Grid Size", ""),
                 "duration_ns": None,
                 "sm_pct": None,
-                "dram_pct": None,
+                "mem_pct": None,
                 "warps_pct": None,
             },
         )
@@ -686,8 +729,8 @@ def build_ncu_slice_cache(report_path: Path) -> Dict[str, Any]:
                 "duration_sample_count": 0,
                 "sm_total": 0.0,
                 "sm_count": 0,
-                "dram_total": 0.0,
-                "dram_count": 0,
+                "mem_total": 0.0,
+                "mem_count": 0,
                 "warps_total": 0.0,
                 "warps_count": 0,
             },
@@ -699,9 +742,9 @@ def build_ncu_slice_cache(report_path: Path) -> Dict[str, Any]:
         if launch.get("sm_pct") is not None:
             group["sm_total"] += float(launch["sm_pct"])
             group["sm_count"] += 1
-        if launch.get("dram_pct") is not None:
-            group["dram_total"] += float(launch["dram_pct"])
-            group["dram_count"] += 1
+        if launch.get("mem_pct") is not None:
+            group["mem_total"] += float(launch["mem_pct"])
+            group["mem_count"] += 1
         if launch.get("warps_pct") is not None:
             group["warps_total"] += float(launch["warps_pct"])
             group["warps_count"] += 1
@@ -720,7 +763,7 @@ def build_ncu_slice_cache(report_path: Path) -> Dict[str, Any]:
                 "total_duration_ns": int(group["total_duration_ns"]),
                 "avg_duration_ns": int(avg_duration_ns) if avg_duration_ns is not None else None,
                 "avg_sm_pct": average_or_none(group["sm_total"], group["sm_count"]),
-                "avg_dram_pct": average_or_none(group["dram_total"], group["dram_count"]),
+                "avg_mem_pct": average_or_none(group["mem_total"], group["mem_count"]),
                 "avg_warps_pct": average_or_none(group["warps_total"], group["warps_count"]),
             }
         )
@@ -739,6 +782,7 @@ def build_ncu_slice_cache(report_path: Path) -> Dict[str, Any]:
         "report_path": str(report_path),
         "report_size_bytes": report_stat.st_size,
         "report_mtime_ns": report_stat.st_mtime_ns,
+        "cache_schema_version": NCU_SLICE_CACHE_VERSION,
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "metrics": NCU_SLICE_METRICS.split(","),
         "summary": {
@@ -761,7 +805,8 @@ def load_ncu_slice_cache(report_path: Path, refresh: bool = False) -> Dict[str, 
     if not refresh and cache_path.exists():
         cache = read_json(cache_path)
         if (
-            cache.get("report_path") == str(report_path)
+            int(cache.get("cache_schema_version", -1)) == NCU_SLICE_CACHE_VERSION
+            and cache.get("report_path") == str(report_path)
             and int(cache.get("report_size_bytes", -1)) == report_stat.st_size
             and int(cache.get("report_mtime_ns", -1)) == report_stat.st_mtime_ns
         ):
@@ -935,8 +980,12 @@ def inspect_ncu_command(args: argparse.Namespace) -> int:
         if sort_key == "sm_pct":
             metric_value = row.get("avg_sm_pct") if args.view == "kernels" else row.get("sm_pct")
             return -(metric_value if metric_value is not None else -1)
-        if sort_key == "dram_pct":
-            metric_value = row.get("avg_dram_pct") if args.view == "kernels" else row.get("dram_pct")
+        if sort_key in {"mem_pct", "dram_pct"}:
+            metric_value = (
+                ncu_cache_metric_value(row, "avg_mem_pct", "avg_dram_pct")
+                if args.view == "kernels"
+                else ncu_cache_metric_value(row, "mem_pct", "dram_pct")
+            )
             return -(metric_value if metric_value is not None else -1)
         if sort_key == "warps_pct":
             metric_value = row.get("avg_warps_pct") if args.view == "kernels" else row.get("warps_pct")
@@ -960,7 +1009,7 @@ def inspect_ncu_command(args: argparse.Namespace) -> int:
                 "total_ms": ns_to_ms_text(row.get("total_duration_ns")),
                 "avg_ms": ns_to_ms_text(row.get("avg_duration_ns")),
                 "sm_pct": pct_text(row.get("avg_sm_pct")),
-                "dram_pct": pct_text(row.get("avg_dram_pct")),
+                "mem_pct": pct_text(ncu_cache_metric_value(row, "avg_mem_pct", "avg_dram_pct")),
                 "warps_pct": pct_text(row.get("avg_warps_pct")),
                 "kernel_name": truncate_text(str(row["kernel_name"]), 90),
             }
@@ -974,7 +1023,7 @@ def inspect_ncu_command(args: argparse.Namespace) -> int:
                 ("total_ms", "total_ms"),
                 ("avg_ms", "avg_ms"),
                 ("sm_pct", "sm_pct"),
-                ("dram_pct", "dram_pct"),
+                ("mem_pct", "mem_pct"),
                 ("warps_pct", "warps_pct"),
                 ("kernel_name", "kernel_name"),
             ),
@@ -987,7 +1036,7 @@ def inspect_ncu_command(args: argparse.Namespace) -> int:
             "family": row["family"],
             "duration_ms": ns_to_ms_text(row.get("duration_ns")),
             "sm_pct": pct_text(row.get("sm_pct")),
-            "dram_pct": pct_text(row.get("dram_pct")),
+            "mem_pct": pct_text(ncu_cache_metric_value(row, "mem_pct", "dram_pct")),
             "warps_pct": pct_text(row.get("warps_pct")),
             "kernel_name": truncate_text(str(row["kernel_name"]), 80),
         }
@@ -1000,7 +1049,7 @@ def inspect_ncu_command(args: argparse.Namespace) -> int:
             ("family", "family"),
             ("duration_ms", "duration_ms"),
             ("sm_pct", "sm_pct"),
-            ("dram_pct", "dram_pct"),
+            ("mem_pct", "mem_pct"),
             ("warps_pct", "warps_pct"),
             ("kernel_name", "kernel_name"),
         ),
@@ -1478,28 +1527,39 @@ def target_preflight_command(args: argparse.Namespace) -> int:
     toolchain_file = repo_root / "cmake" / "aarch64_linux_toolchain.cmake"
     trt_package_dir = os.environ.get("TRT_PACKAGE_DIR", "/usr")
     embedded_target = detect_embedded_target()
-
-    if args.force_reconfigure or not cmake_cache.exists():
+    nvtx_enabled_before = cmake_cache_bool(cmake_cache, "ENABLE_NVTX_PROFILING")
+    needs_nvtx_reconfigure = nvtx_enabled_before is not True
+    cmake_ran = False
+    if args.force_reconfigure or not cmake_cache.exists() or needs_nvtx_reconfigure:
         run(
             [
-                "cmake",
+                required_commands["cmake"],
                 str(repo_root),
                 "-DCMAKE_BUILD_TYPE=Release",
                 f"-DTRT_PACKAGE_DIR={trt_package_dir}",
                 f"-DCMAKE_TOOLCHAIN_FILE={toolchain_file}",
                 f"-DEMBEDDED_TARGET={embedded_target}",
+                "-DENABLE_NVTX_PROFILING=ON",
             ],
             cwd=build_dir,
+        )
+        cmake_ran = True
+
+    nvtx_enabled_after = cmake_cache_bool(cmake_cache, "ENABLE_NVTX_PROFILING")
+    if nvtx_enabled_after is not True:
+        fail(
+            "TensorRT Edge-LLM was not configured with ENABLE_NVTX_PROFILING=ON. "
+            f"Observed CMake cache value: {cmake_cache_value(cmake_cache, 'ENABLE_NVTX_PROFILING')!r}"
         )
 
     build_jobs = max(1, args.jobs or (os.cpu_count() or 1))
     build_binary_paths = [llm_build_path(repo_root), llm_inference_path(repo_root)]
-    if args.force_rebuild or any(not path.exists() for path in build_binary_paths):
-        run(["make", f"-j{build_jobs}"], cwd=build_dir)
+    if cmake_ran or args.force_rebuild or any(not path.exists() for path in build_binary_paths):
+        run([required_commands["make"], f"-j{build_jobs}"], cwd=build_dir)
 
     check_required_paths(build_binary_paths, "Edge-LLM runtime binary")
 
-    nvcc_version = run(["nvcc", "--version"], capture_output=True).stdout.strip()
+    nvcc_version = run([required_commands["nvcc"], "--version"], capture_output=True).stdout.strip()
     dpkg_output = run(["dpkg", "-l"], capture_output=True).stdout
     tensorrt_lines = [
         line
@@ -1518,6 +1578,8 @@ def target_preflight_command(args: argparse.Namespace) -> int:
         "required_commands": required_commands,
         "trt_package_dir": trt_package_dir,
         "embedded_target": embedded_target,
+        "nvtx_profiling_enabled": True,
+        "cmake_reconfigured": cmake_ran,
         "nvcc_version": nvcc_version,
         "tensorrt_packages": tensorrt_lines,
         "nv_tegra_release": tegra_release.read_text().strip() if tegra_release.exists() else None,
@@ -1643,8 +1705,11 @@ def ensure_target_binaries(config: Dict[str, Any], repo_override: Optional[str] 
     repo_root = target_repo_root(config, repo_override)
     build_path = llm_build_path(repo_root)
     inference_path = llm_inference_path(repo_root)
+    build_dir = repo_root / "build"
+    cmake_cache = build_dir / "CMakeCache.txt"
+    nvtx_enabled = cmake_cache_bool(cmake_cache, "ENABLE_NVTX_PROFILING") is True
 
-    if build_path.exists() and inference_path.exists():
+    if build_path.exists() and inference_path.exists() and nvtx_enabled:
         return {
             "repo_root": str(repo_root),
             "llm_build_path": str(build_path),
@@ -1702,6 +1767,8 @@ def build_engine_command(args: argparse.Namespace) -> int:
         "requested_model_id": REQUESTED_MODEL_ID,
         "actual_model_id": REQUESTED_MODEL_ID,
         "precision": EXPORT_PRECISION,
+        "nvtx_profiling_enabled": cmake_cache_bool(repo_root / "build" / "CMakeCache.txt", "ENABLE_NVTX_PROFILING")
+        is True,
         "engine_dir": str(target_engine_dir),
         "onnx_dir": str(onnx_dir(config)),
         "llm_build_path": runtime_paths["llm_build_path"],
@@ -1719,6 +1786,8 @@ def build_engine_command(args: argparse.Namespace) -> int:
         "requested_model_id": REQUESTED_MODEL_ID,
         "actual_model_id": REQUESTED_MODEL_ID,
         "precision": EXPORT_PRECISION,
+        "nvtx_profiling_enabled": cmake_cache_bool(repo_root / "build" / "CMakeCache.txt", "ENABLE_NVTX_PROFILING")
+        is True,
         "engine_dir": str(target_engine_dir),
         "llm_inference_path": runtime_paths["llm_inference_path"],
         "llm_build_path": runtime_paths["llm_build_path"],
@@ -2119,6 +2188,103 @@ def execute_inference_run(
     return metadata
 
 
+def build_inference_launch_spec(
+    runtime: Dict[str, Any],
+    phase: str,
+    input_path: Path,
+    output_path: Path,
+    input_metadata: Dict[str, Any],
+    *,
+    warmup_runs: int = 0,
+    runtime_profile_output: Optional[Path] = None,
+) -> Dict[str, Any]:
+    if warmup_runs < 0:
+        fail("--warmup-runs must be non-negative.")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        str(runtime["llm_inference_path"]),
+        "--engineDir",
+        str(runtime["engine_dir"]),
+        "--inputFile",
+        str(input_path),
+        "--outputFile",
+        str(output_path),
+    ]
+    if warmup_runs > 0:
+        cmd.extend(["--warmup", str(warmup_runs)])
+    if runtime_profile_output is not None:
+        runtime_profile_output.parent.mkdir(parents=True, exist_ok=True)
+        cmd.extend(
+            [
+                "--dumpProfile",
+                "--profileOutputFile",
+                str(runtime_profile_output),
+            ]
+        )
+
+    repo_root_str = runtime.get("repo_root")
+    cwd = Path(str(repo_root_str)) if repo_root_str else None
+    plugin_path_str = runtime.get("edgellm_plugin_path")
+    env_overrides: Dict[str, str] = {}
+    if plugin_path_str:
+        env_overrides["EDGELLM_PLUGIN_PATH"] = str(plugin_path_str)
+
+    return {
+        "prepared_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "phase": phase,
+        "workflow_backend": WORKFLOW_BACKEND,
+        "requested_model_id": str(runtime.get("requested_model_id", REQUESTED_MODEL_ID)),
+        "actual_model_id": str(runtime.get("actual_model_id", REQUESTED_MODEL_ID)),
+        "precision": str(runtime.get("precision", EXPORT_PRECISION)),
+        "engine_dir": str(runtime["engine_dir"]),
+        "llm_inference_path": str(runtime["llm_inference_path"]),
+        "input_file": str(input_path),
+        "output_file": str(output_path),
+        "runtime_profile_json": str(runtime_profile_output) if runtime_profile_output is not None else None,
+        "requested_max_generate_length": input_metadata.get("max_generate_length"),
+        "phase_workload": copy.deepcopy(input_metadata),
+        "warmup_runs": int(warmup_runs),
+        "run_command": cmd,
+        "cwd": str(cwd) if cwd is not None else None,
+        "env_overrides": env_overrides,
+    }
+
+
+def emit_inference_launch_command(args: argparse.Namespace) -> int:
+    config = load_run_config()
+    runtime = load_selected_runtime(config)
+    phase = args.phase
+    input_path, input_metadata = resolve_inference_input(
+        config,
+        runtime,
+        phase,
+        input_file=args.input_file,
+        prompt_override=args.prompt,
+        max_generate_length_override=args.max_generate_length,
+    )
+    output_path = Path(args.output_file).resolve() if args.output_file else runtime_output_path(config, phase)
+    runtime_profile_output = (
+        Path(args.runtime_profile_output).resolve() if args.runtime_profile_output else None
+    )
+    launch_spec = build_inference_launch_spec(
+        runtime,
+        phase,
+        input_path,
+        output_path,
+        input_metadata,
+        warmup_runs=args.warmup_runs,
+        runtime_profile_output=runtime_profile_output,
+    )
+
+    if args.output:
+        write_json(Path(args.output).resolve(), launch_spec)
+    else:
+        print(json.dumps(launch_spec, indent=2))
+    return 0
+
+
 def run_inference_command(args: argparse.Namespace) -> int:
     config = load_run_config()
     runtime = load_selected_runtime(config)
@@ -2399,7 +2565,7 @@ def benchmark_phase_command(args: argparse.Namespace) -> int:
 
 
 def export_nsys_sqlite(report_path: Path) -> Path:
-    sqlite_prefix = report_path.with_suffix("")
+    sqlite_prefix = report_path.with_suffix(".sqlite")
     run(
         [
             "nsys",
@@ -2413,12 +2579,9 @@ def export_nsys_sqlite(report_path: Path) -> Path:
         ]
     )
 
-    sqlite_path = sqlite_prefix.with_suffix(".sqlite")
-    if sqlite_path.exists():
-        return sqlite_path
-    if sqlite_prefix.exists() and sqlite_prefix.suffix != ".sqlite":
+    if sqlite_prefix.exists():
         return sqlite_prefix
-    fail(f"Expected exported SQLite report was not created at {sqlite_path} or {sqlite_prefix}")
+    fail(f"Expected exported SQLite report was not created at {sqlite_prefix}")
 
 
 def sqlite_table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
@@ -2429,51 +2592,188 @@ def sqlite_table_exists(connection: sqlite3.Connection, table_name: str) -> bool
     return row is not None
 
 
-def summarize_nsys_sqlite(sqlite_path: Path, top_limit: int = 20) -> Dict[str, Any]:
+def summarize_nsys_sqlite(
+    sqlite_path: Path,
+    phase_range_name: Optional[str] = None,
+    top_limit: int = 20,
+) -> Dict[str, Any]:
     with sqlite3.connect(str(sqlite_path)) as connection:
         connection.row_factory = sqlite3.Row
 
-        def sum_duration_ns(table_name: str) -> int:
-            if not sqlite_table_exists(connection, table_name):
-                return 0
-            row = connection.execute(
-                f"SELECT COALESCE(SUM(end - start), 0) AS total_ns FROM {table_name}"
-            ).fetchone()
-            return int(row["total_ns"] or 0) if row else 0
+        def select_rows(query: str, params: Sequence[Any] = ()) -> List[sqlite3.Row]:
+            return list(connection.execute(query, tuple(params)).fetchall())
 
-        def count_rows(table_name: str) -> int:
+        def find_phase_window(range_name: str) -> Dict[str, Any]:
+            if not sqlite_table_exists(connection, "NVTX_EVENTS"):
+                fail(f"Nsight Systems SQLite report {sqlite_path} does not contain NVTX_EVENTS.")
+
+            rows = select_rows(
+                """
+                SELECT start, end, domainId, text
+                FROM NVTX_EVENTS
+                WHERE text = ? AND end IS NOT NULL
+                ORDER BY start
+                """,
+                (range_name,),
+            )
+            if not rows:
+                fail(
+                    f"Nsight Systems SQLite report {sqlite_path} does not contain the NVTX range "
+                    f"{range_name!r}."
+                )
+
+            intervals = [(int(row["start"]), int(row["end"])) for row in rows]
+            start_ns = min(start for start, _ in intervals)
+            end_ns = max(end for _, end in intervals)
+            total_duration_ns = sum(max(0, end - start) for start, end in intervals)
+            return {
+                "range_name": range_name,
+                "match_count": len(intervals),
+                "domain_ids": sorted({int(row["domainId"] or 0) for row in rows}),
+                "start_ns": start_ns,
+                "end_ns": end_ns,
+                "span_ns": max(0, end_ns - start_ns),
+                "span_ms": max(0, end_ns - start_ns) / 1_000_000.0,
+                "total_duration_ns": total_duration_ns,
+                "total_duration_ms": total_duration_ns / 1_000_000.0,
+            }
+
+        phase_capture = find_phase_window(phase_range_name) if phase_range_name else None
+        phase_start_ns = int(phase_capture["start_ns"]) if phase_capture else None
+        phase_end_ns = int(phase_capture["end_ns"]) if phase_capture else None
+
+        def phase_predicate(alias: str) -> Tuple[str, Tuple[Any, ...]]:
+            if phase_start_ns is None or phase_end_ns is None:
+                return "", ()
+            return f" WHERE {alias}.end > ? AND {alias}.start < ?", (phase_start_ns, phase_end_ns)
+
+        def clip_interval(start_ns: int, end_ns: int) -> Tuple[int, int, int]:
+            start_ns = int(start_ns)
+            end_ns = int(end_ns)
+            if phase_start_ns is None or phase_end_ns is None:
+                return start_ns, end_ns, max(0, end_ns - start_ns)
+
+            clipped_start_ns = max(start_ns, phase_start_ns)
+            clipped_end_ns = min(end_ns, phase_end_ns)
+            return clipped_start_ns, clipped_end_ns, max(0, clipped_end_ns - clipped_start_ns)
+
+        def duration_stats_from_rows(rows: Sequence[sqlite3.Row]) -> Dict[str, Any]:
+            durations: List[int] = []
+            clipped_starts: List[int] = []
+            clipped_ends: List[int] = []
+            for row in rows:
+                clipped_start_ns, clipped_end_ns, duration_ns = clip_interval(row["start"], row["end"])
+                if duration_ns <= 0:
+                    continue
+                durations.append(duration_ns)
+                clipped_starts.append(clipped_start_ns)
+                clipped_ends.append(clipped_end_ns)
+
+            total_ns = sum(durations)
+            return {
+                "count": len(durations),
+                "total_ns": total_ns,
+                "avg_ns": (float(total_ns) / len(durations)) if durations else 0.0,
+                "min_ns": min(durations) if durations else 0,
+                "max_ns": max(durations) if durations else 0,
+                "start_ns": min(clipped_starts) if clipped_starts else 0,
+                "end_ns": max(clipped_ends) if clipped_ends else 0,
+                "span_ns": (
+                    max(clipped_ends) - min(clipped_starts)
+                    if clipped_starts and clipped_ends
+                    else 0
+                ),
+            }
+
+        def fetch_interval_rows(table_name: str, alias: str) -> List[sqlite3.Row]:
             if not sqlite_table_exists(connection, table_name):
-                return 0
-            row = connection.execute(f"SELECT COUNT(*) AS count FROM {table_name}").fetchone()
-            return int(row["count"] or 0) if row else 0
+                return []
+            where_sql, params = phase_predicate(alias)
+            return select_rows(
+                f"SELECT {alias}.start AS start, {alias}.end AS end FROM {table_name} AS {alias}{where_sql}",
+                params,
+            )
+
+        kernel_rows = fetch_interval_rows("CUPTI_ACTIVITY_KIND_KERNEL", "kernel")
+        memcpy_rows = fetch_interval_rows("CUPTI_ACTIVITY_KIND_MEMCPY", "memcpy")
+        memset_rows = fetch_interval_rows("CUPTI_ACTIVITY_KIND_MEMSET", "memset")
+        graph_rows = fetch_interval_rows("CUPTI_ACTIVITY_KIND_GRAPH_TRACE", "graph_trace")
+
+        kernel_stats = duration_stats_from_rows(kernel_rows)
+        memcpy_stats = duration_stats_from_rows(memcpy_rows)
+        memset_stats = duration_stats_from_rows(memset_rows)
+        graph_stats = duration_stats_from_rows(graph_rows)
+
+        activity_starts = [
+            stats["start_ns"]
+            for stats in (kernel_stats, memcpy_stats, memset_stats, graph_stats)
+            if int(stats["count"]) > 0
+        ]
+        activity_ends = [
+            stats["end_ns"]
+            for stats in (kernel_stats, memcpy_stats, memset_stats, graph_stats)
+            if int(stats["count"]) > 0
+        ]
+        activity_bounds = {
+            "start_ns": min(activity_starts) if activity_starts else 0,
+            "end_ns": max(activity_ends) if activity_ends else 0,
+            "span_ns": (
+                max(activity_ends) - min(activity_starts)
+                if activity_starts and activity_ends
+                else 0
+            ),
+        }
 
         top_kernels: List[Dict[str, Any]] = []
         if sqlite_table_exists(connection, "CUPTI_ACTIVITY_KIND_KERNEL"):
-            rows = connection.execute(
-                """
+            where_sql, params = phase_predicate("kernel")
+            rows = select_rows(
+                f"""
                 SELECT
-                    COALESCE(demangled.value, short_name.value, '<unknown>') AS kernel_name,
-                    COUNT(*) AS launch_count,
-                    SUM(kernel.end - kernel.start) AS total_duration_ns,
-                    AVG(kernel.end - kernel.start) AS avg_duration_ns,
-                    MAX(kernel.end - kernel.start) AS max_duration_ns
+                    kernel.start AS start,
+                    kernel.end AS end,
+                    COALESCE(demangled.value, short_name.value, '<unknown>') AS kernel_name
                 FROM CUPTI_ACTIVITY_KIND_KERNEL AS kernel
                 LEFT JOIN StringIds AS demangled ON kernel.demangledName = demangled.id
                 LEFT JOIN StringIds AS short_name ON kernel.shortName = short_name.id
-                GROUP BY kernel_name
-                ORDER BY total_duration_ns DESC
-                LIMIT ?
+                {where_sql}
                 """,
-                (top_limit,),
-            ).fetchall()
+                params,
+            )
+
+            kernel_totals: Dict[str, Dict[str, Any]] = {}
             for row in rows:
-                total_duration_ns = int(row["total_duration_ns"] or 0)
-                avg_duration_ns = float(row["avg_duration_ns"] or 0.0)
-                max_duration_ns = int(row["max_duration_ns"] or 0)
+                _, _, duration_ns = clip_interval(row["start"], row["end"])
+                if duration_ns <= 0:
+                    continue
+                kernel_name = str(row["kernel_name"])
+                entry = kernel_totals.setdefault(
+                    kernel_name,
+                    {
+                        "kernel_name": kernel_name,
+                        "launch_count": 0,
+                        "total_duration_ns": 0,
+                        "max_duration_ns": 0,
+                    },
+                )
+                entry["launch_count"] += 1
+                entry["total_duration_ns"] += duration_ns
+                entry["max_duration_ns"] = max(int(entry["max_duration_ns"]), duration_ns)
+
+            sorted_kernel_totals = sorted(
+                kernel_totals.values(),
+                key=lambda entry: (int(entry["total_duration_ns"]), int(entry["launch_count"])),
+                reverse=True,
+            )[:top_limit]
+            for entry in sorted_kernel_totals:
+                total_duration_ns = int(entry["total_duration_ns"])
+                launch_count = int(entry["launch_count"])
+                avg_duration_ns = float(total_duration_ns) / launch_count if launch_count else 0.0
+                max_duration_ns = int(entry["max_duration_ns"])
                 top_kernels.append(
                     {
-                        "kernel_name": str(row["kernel_name"]),
-                        "launch_count": int(row["launch_count"] or 0),
+                        "kernel_name": str(entry["kernel_name"]),
+                        "launch_count": launch_count,
                         "total_duration_ns": total_duration_ns,
                         "total_duration_ms": total_duration_ns / 1_000_000.0,
                         "avg_duration_ns": avg_duration_ns,
@@ -2485,32 +2785,35 @@ def summarize_nsys_sqlite(sqlite_path: Path, top_limit: int = 20) -> Dict[str, A
 
         top_memcpy: List[Dict[str, Any]] = []
         if sqlite_table_exists(connection, "CUPTI_ACTIVITY_KIND_MEMCPY"):
-            rows = connection.execute(
-                """
+            where_sql, params = phase_predicate("memcpy")
+            rows = select_rows(
+                f"""
                 SELECT
-                    memcpy.start AS start_ns,
-                    memcpy.end AS end_ns,
-                    (memcpy.end - memcpy.start) AS duration_ns,
+                    memcpy.start AS start,
+                    memcpy.end AS end,
                     memcpy.bytes AS bytes,
                     memcpy.streamId AS stream_id,
                     memcpy.contextId AS context_id,
                     COALESCE(copy_kind.label, CAST(memcpy.copyKind AS TEXT)) AS copy_kind
                 FROM CUPTI_ACTIVITY_KIND_MEMCPY AS memcpy
                 LEFT JOIN ENUM_CUDA_MEMCPY_OPER AS copy_kind ON memcpy.copyKind = copy_kind.id
-                ORDER BY duration_ns DESC
-                LIMIT ?
+                {where_sql}
                 """,
-                (top_limit,),
-            ).fetchall()
+                params,
+            )
+
+            memcpy_events: List[Dict[str, Any]] = []
             for row in rows:
-                duration_ns = int(row["duration_ns"] or 0)
+                clipped_start_ns, clipped_end_ns, duration_ns = clip_interval(row["start"], row["end"])
+                if duration_ns <= 0:
+                    continue
                 byte_count = int(row["bytes"] or 0)
                 throughput_mb_per_s = (
                     (byte_count / 1_000_000.0) / (duration_ns / 1_000_000_000.0)
                     if duration_ns > 0
                     else 0.0
                 )
-                top_memcpy.append(
+                memcpy_events.append(
                     {
                         "copy_kind": str(row["copy_kind"]),
                         "bytes": byte_count,
@@ -2519,38 +2822,46 @@ def summarize_nsys_sqlite(sqlite_path: Path, top_limit: int = 20) -> Dict[str, A
                         "throughput_mb_per_s": throughput_mb_per_s,
                         "stream_id": int(row["stream_id"] or 0),
                         "context_id": int(row["context_id"] or 0),
-                        "start_ns": int(row["start_ns"] or 0),
-                        "end_ns": int(row["end_ns"] or 0),
+                        "start_ns": clipped_start_ns,
+                        "end_ns": clipped_end_ns,
                     }
                 )
+            top_memcpy = sorted(
+                memcpy_events,
+                key=lambda entry: int(entry["duration_ns"]),
+                reverse=True,
+            )[:top_limit]
 
         top_memset: List[Dict[str, Any]] = []
         if sqlite_table_exists(connection, "CUPTI_ACTIVITY_KIND_MEMSET"):
-            rows = connection.execute(
-                """
+            where_sql, params = phase_predicate("memset")
+            rows = select_rows(
+                f"""
                 SELECT
-                    memset.start AS start_ns,
-                    memset.end AS end_ns,
-                    (memset.end - memset.start) AS duration_ns,
+                    memset.start AS start,
+                    memset.end AS end,
                     memset.bytes AS bytes,
                     memset.value AS value,
                     memset.streamId AS stream_id,
                     memset.contextId AS context_id
                 FROM CUPTI_ACTIVITY_KIND_MEMSET AS memset
-                ORDER BY duration_ns DESC
-                LIMIT ?
+                {where_sql}
                 """,
-                (top_limit,),
-            ).fetchall()
+                params,
+            )
+
+            memset_events: List[Dict[str, Any]] = []
             for row in rows:
-                duration_ns = int(row["duration_ns"] or 0)
+                clipped_start_ns, clipped_end_ns, duration_ns = clip_interval(row["start"], row["end"])
+                if duration_ns <= 0:
+                    continue
                 byte_count = int(row["bytes"] or 0)
                 throughput_mb_per_s = (
                     (byte_count / 1_000_000.0) / (duration_ns / 1_000_000_000.0)
                     if duration_ns > 0
                     else 0.0
                 )
-                top_memset.append(
+                memset_events.append(
                     {
                         "bytes": byte_count,
                         "value": int(row["value"] or 0),
@@ -2559,27 +2870,57 @@ def summarize_nsys_sqlite(sqlite_path: Path, top_limit: int = 20) -> Dict[str, A
                         "throughput_mb_per_s": throughput_mb_per_s,
                         "stream_id": int(row["stream_id"] or 0),
                         "context_id": int(row["context_id"] or 0),
-                        "start_ns": int(row["start_ns"] or 0),
-                        "end_ns": int(row["end_ns"] or 0),
+                        "start_ns": clipped_start_ns,
+                        "end_ns": clipped_end_ns,
                     }
                 )
+            top_memset = sorted(
+                memset_events,
+                key=lambda entry: int(entry["duration_ns"]),
+                reverse=True,
+            )[:top_limit]
 
-        kernel_total_ns = sum_duration_ns("CUPTI_ACTIVITY_KIND_KERNEL")
-        memcpy_total_ns = sum_duration_ns("CUPTI_ACTIVITY_KIND_MEMCPY")
-        memset_total_ns = sum_duration_ns("CUPTI_ACTIVITY_KIND_MEMSET")
+        kernel_total_ns = int(kernel_stats["total_ns"])
+        memcpy_total_ns = int(memcpy_stats["total_ns"])
+        memset_total_ns = int(memset_stats["total_ns"])
         total_gpu_activity_ns = kernel_total_ns + memcpy_total_ns + memset_total_ns
+        phase_wall_gpu_time_ns = (
+            int(graph_stats["total_ns"])
+            if int(graph_stats["count"]) > 0
+            else int(activity_bounds["span_ns"])
+        )
+        phase_wall_source = "graph_trace" if int(graph_stats["count"]) > 0 else "activity_span"
 
         return {
+            "phase_capture": phase_capture,
             "gpu_activity": {
-                "kernel_launch_count": count_rows("CUPTI_ACTIVITY_KIND_KERNEL"),
-                "memcpy_count": count_rows("CUPTI_ACTIVITY_KIND_MEMCPY"),
-                "memset_count": count_rows("CUPTI_ACTIVITY_KIND_MEMSET"),
+                "kernel_launch_count": int(kernel_stats["count"]),
+                "memcpy_count": int(memcpy_stats["count"]),
+                "memset_count": int(memset_stats["count"]),
+                "graph_launch_count": int(graph_stats["count"]),
                 "total_kernel_gpu_time_ns": kernel_total_ns,
                 "total_kernel_gpu_time_ms": kernel_total_ns / 1_000_000.0,
                 "total_memcpy_gpu_time_ns": memcpy_total_ns,
                 "total_memcpy_gpu_time_ms": memcpy_total_ns / 1_000_000.0,
                 "total_memset_gpu_time_ns": memset_total_ns,
                 "total_memset_gpu_time_ms": memset_total_ns / 1_000_000.0,
+                "graph_total_gpu_time_ns": int(graph_stats["total_ns"]),
+                "graph_total_gpu_time_ms": int(graph_stats["total_ns"]) / 1_000_000.0,
+                "graph_avg_gpu_time_ns": float(graph_stats["avg_ns"]),
+                "graph_avg_gpu_time_ms": float(graph_stats["avg_ns"]) / 1_000_000.0,
+                "graph_min_gpu_time_ns": int(graph_stats["min_ns"]),
+                "graph_min_gpu_time_ms": int(graph_stats["min_ns"]) / 1_000_000.0,
+                "graph_max_gpu_time_ns": int(graph_stats["max_ns"]),
+                "graph_max_gpu_time_ms": int(graph_stats["max_ns"]) / 1_000_000.0,
+                "activity_start_ns": int(activity_bounds["start_ns"]),
+                "activity_end_ns": int(activity_bounds["end_ns"]),
+                "activity_span_gpu_time_ns": int(activity_bounds["span_ns"]),
+                "activity_span_gpu_time_ms": int(activity_bounds["span_ns"]) / 1_000_000.0,
+                "phase_wall_source": phase_wall_source,
+                "phase_wall_gpu_time_ns": phase_wall_gpu_time_ns,
+                "phase_wall_gpu_time_ms": phase_wall_gpu_time_ns / 1_000_000.0,
+                "total_activity_gpu_time_ns": total_gpu_activity_ns,
+                "total_activity_gpu_time_ms": total_gpu_activity_ns / 1_000_000.0,
                 "total_captured_gpu_time_ns": total_gpu_activity_ns,
                 "total_captured_gpu_time_ms": total_gpu_activity_ns / 1_000_000.0,
             },
@@ -2598,7 +2939,8 @@ def summarize_nsys_command(args: argparse.Namespace) -> int:
 
     sqlite_path = export_nsys_sqlite(report_path)
     phase_workload = copy.deepcopy(config["phase_workloads"][args.phase])
-    nsys_activity_summary = summarize_nsys_sqlite(sqlite_path)
+    phase_range_name = "LLM_PREFILL" if args.phase == "prefill" else "LLM_GENERATION"
+    nsys_activity_summary = summarize_nsys_sqlite(sqlite_path, phase_range_name=phase_range_name)
     summary = {
         "phase": args.phase,
         "workflow_backend": WORKFLOW_BACKEND,
@@ -2839,6 +3181,19 @@ def build_parser() -> argparse.ArgumentParser:
     build_engine.add_argument("--repo-root", default=None)
     build_engine.add_argument("--force", action="store_true")
 
+    emit_inference_launch = subparsers.add_parser(
+        "emit-inference-launch",
+        help="Resolve the exact llm_inference command, cwd, and environment for a phase workload.",
+    )
+    emit_inference_launch.add_argument("--phase", choices=["prefill", "decode"], default="decode")
+    emit_inference_launch.add_argument("--input-file", default=None)
+    emit_inference_launch.add_argument("--output-file", default=None)
+    emit_inference_launch.add_argument("--output", default=None)
+    emit_inference_launch.add_argument("--max-generate-length", type=int, default=None)
+    emit_inference_launch.add_argument("--prompt", default=None)
+    emit_inference_launch.add_argument("--warmup-runs", type=int, default=0)
+    emit_inference_launch.add_argument("--runtime-profile-output", default=None)
+
     run_inference = subparsers.add_parser(
         "run-inference",
         help="Run llm_inference using the selected Edge-LLM engine and a generated phase workload.",
@@ -2898,7 +3253,7 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_ncu.add_argument("--name-contains", default=None)
     inspect_ncu.add_argument(
         "--sort",
-        choices=["total_ms", "avg_ms", "count", "sm_pct", "dram_pct", "warps_pct", "id"],
+        choices=["total_ms", "avg_ms", "count", "sm_pct", "mem_pct", "dram_pct", "warps_pct", "id"],
         default="total_ms",
     )
     inspect_ncu.add_argument("--limit", type=int, default=10)
@@ -2932,6 +3287,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return target_fetch_export_command(args)
         if args.command == "build-engine":
             return build_engine_command(args)
+        if args.command == "emit-inference-launch":
+            return emit_inference_launch_command(args)
         if args.command == "run-inference":
             return run_inference_command(args)
         if args.command == "benchmark-phase":

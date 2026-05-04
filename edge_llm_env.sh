@@ -55,6 +55,10 @@ function workflow_log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
 }
 
+function run_pip() {
+  "$PYTHON_BIN" -m pip "$@"
+}
+
 function python_env_is_python312() {
   local python_bin="${1:-$PYTHON_BIN}"
 
@@ -65,8 +69,13 @@ raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 1)
 PY
 }
 
+function pip_module_is_usable() {
+  local python_bin="${1:-$PYTHON_BIN}"
+  "$python_bin" -m pip --version >/dev/null 2>&1
+}
+
 function env_has_required_binaries() {
-  [[ -x "$DL_ENV_ROOT/bin/python" && -x "$DL_ENV_ROOT/bin/pip" ]]
+  [[ -x "$DL_ENV_ROOT/bin/python" ]] && pip_module_is_usable "$DL_ENV_ROOT/bin/python"
 }
 
 function env_is_usable() {
@@ -80,7 +89,7 @@ function env_is_usable() {
 function ensure_selected_python_env() {
   if [[ "$DL_ENV_ROOT" == "$LEGACY_DL_ENV_ROOT" ]]; then
     if ! env_has_required_binaries; then
-      workflow_log "Legacy Python environment detected at $DL_ENV_ROOT, but bin/python or bin/pip is missing."
+      workflow_log "Legacy Python environment detected at $DL_ENV_ROOT, but python or the pip module is unusable."
       workflow_log "Please repair or remove that directory so the workflow can create and use $FALLBACK_DL_ENV_ROOT instead."
       exit 1
     fi
@@ -171,8 +180,8 @@ function require_python_env() {
     exit 1
   fi
 
-  if [[ ! -x "$PIP_BIN" ]]; then
-    workflow_log "Expected pip executable not found at $PIP_BIN"
+  if ! pip_module_is_usable "$PYTHON_BIN"; then
+    workflow_log "Expected a usable pip module for $PYTHON_BIN"
     exit 1
   fi
 
