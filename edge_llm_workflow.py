@@ -9,6 +9,7 @@ import csv
 import hashlib
 import io
 import json
+import math
 import os
 import platform
 import shutil
@@ -141,6 +142,11 @@ NCU_FAMILIES = (
     "sampling_like",
     "other",
 )
+
+DECODE_STEADY_STATE_MODE = "steady_state_iterations"
+SINGLE_REPORT_NCU_MODE = "single_report"
+DECODE_STEADY_STATE_FRACTIONS = (0.25, 0.5, 0.75)
+DECODE_STEADY_STATE_REPRESENTATIVE_INDEX = 1
 
 
 class WorkflowError(RuntimeError):
@@ -518,6 +524,140 @@ def metric_value_to_float(value: str) -> Optional[float]:
         return None
 
 
+def decode_iteration_range_name(iteration: int) -> str:
+    return f"DECODE_ITER_{int(iteration):03d}"
+
+
+def decode_iteration_phase_filter(iteration: int) -> str:
+    return f"LLM_GENERATION/{decode_iteration_range_name(iteration)}/"
+
+
+def decode_loop_count_from_output_tokens(actual_output_token_count: Optional[Any]) -> Optional[int]:
+    try:
+        output_token_count = int(actual_output_token_count)
+    except (TypeError, ValueError):
+        return None
+
+    if output_token_count <= 0:
+        return 0
+    return max(0, output_token_count - 1)
+
+
+def select_decode_steady_state_iterations(
+    actual_output_token_count: Optional[Any],
+) -> Dict[str, Any]:
+    decode_loop_count = decode_loop_count_from_output_tokens(actual_output_token_count)
+    if decode_loop_count is None:
+        return {}
+
+    iterations: List[int] = []
+    seen_iterations = set()
+    if decode_loop_count > 0:
+        for fraction in DECODE_STEADY_STATE_FRACTIONS:
+            iteration = int(math.ceil(float(decode_loop_count) * fraction))
+            iteration = max(1, min(decode_loop_count, iteration))
+            if iteration in seen_iterations:
+                continue
+            seen_iterations.add(iteration)
+            iterations.append(iteration)
+
+    representative_iteration = (
+        iterations[min(DECODE_STEADY_STATE_REPRESENTATIVE_INDEX, len(iterations) - 1)]
+        if iterations
+        else None
+    )
+
+    iteration_phase_filters = {
+        str(iteration): decode_iteration_phase_filter(iteration)
+        for iteration in iterations
+    }
+    iteration_range_names = {
+        str(iteration): decode_iteration_range_name(iteration)
+        for iteration in iterations
+    }
+
+    return {
+        "actual_output_token_count": (
+            int(actual_output_token_count)
+            if actual_output_token_count is not None
+            else None
+        ),
+        "decode_loop_count": int(decode_loop_count),
+        "fractions": list(DECODE_STEADY_STATE_FRACTIONS),
+        "iterations": iterations,
+        "representative_iteration": representative_iteration,
+        "iteration_phase_filters": iteration_phase_filters,
+        "iteration_range_names": iteration_range_names,
+    }
+
+
+def decode_iteration_selection_from_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    selection = metadata.get("decode_steady_state_iteration_selection")
+    if isinstance(selection, dict):
+        return selection
+    return select_decode_steady_state_iterations(metadata.get("actual_output_token_count"))
+
+
+def parse_iteration_path_specs(specs: Sequence[str], option_name: str) -> Dict[int, Path]:
+    resolved: Dict[int, Path] = {}
+    for spec in specs:
+        if "=" in spec:
+            iteration_text, path_text = spec.split("=", 1)
+        elif ":" in spec:
+            iteration_text, path_text = spec.split(":", 1)
+        else:
+            fail(f"{option_name} entries must be ITERATION=PATH. Got: {spec!r}")
+
+        try:
+            iteration = int(iteration_text)
+        except ValueError:
+            fail(f"{option_name} iteration must be an integer. Got: {spec!r}")
+
+        if iteration <= 0:
+            fail(f"{option_name} iteration must be positive. Got: {spec!r}")
+        if not path_text:
+            fail(f"{option_name} path must not be empty. Got: {spec!r}")
+        if iteration in resolved:
+            fail(f"{option_name} contains a duplicate iteration: {iteration}")
+
+        resolved[iteration] = Path(path_text).resolve()
+    return resolved
+
+
+def decode_iteration_reports_from_phase_profile(phase_profile: Dict[str, Any]) -> Dict[int, Path]:
+    raw_reports = phase_profile.get("ncu_iteration_reports")
+    if not isinstance(raw_reports, dict):
+        return {}
+
+    resolved: Dict[int, Path] = {}
+    for iteration_key, report_path in raw_reports.items():
+        try:
+            iteration = int(iteration_key)
+        except (TypeError, ValueError):
+            continue
+        if not report_path:
+            continue
+        resolved[iteration] = Path(str(report_path)).resolve()
+    return resolved
+
+
+def top_ncu_kernel_rows(
+    kernel_rows: Sequence[Dict[str, Any]],
+    *,
+    family: Optional[str] = None,
+    limit: int = 10,
+) -> List[Dict[str, Any]]:
+    filtered_rows = [
+        row
+        for row in kernel_rows
+        if family is None or str(row.get("family")) == family
+    ]
+    return [
+        copy.deepcopy(row)
+        for row in filtered_rows[:limit]
+    ]
+
+
 def average_or_none(total: float, count: int) -> Optional[float]:
     if count <= 0:
         return None
@@ -860,13 +1000,55 @@ def print_table(rows: Sequence[Dict[str, Any]], columns: Sequence[Tuple[str, str
 def inspect_ncu_command(args: argparse.Namespace) -> int:
     config = load_run_config()
     report_path: Optional[Path] = None
+    phase_profile = config.get("profiles", {}).get(args.phase or "")
+    steady_state_context: Optional[Dict[str, Any]] = None
+    selected_iteration: Optional[int] = None
 
     if args.report:
         report_path = Path(args.report).resolve()
+        if args.iteration is not None:
+            selected_iteration = int(args.iteration)
     else:
-        phase_profile = config.get("profiles", {}).get(args.phase or "")
-        if isinstance(phase_profile, dict) and phase_profile.get("ncu_rep"):
-            report_path = Path(str(phase_profile["ncu_rep"])).resolve()
+        if (
+            args.phase == "decode"
+            and isinstance(phase_profile, dict)
+            and phase_profile.get("ncu_mode") == DECODE_STEADY_STATE_MODE
+        ):
+            iteration_reports = decode_iteration_reports_from_phase_profile(phase_profile)
+            iteration_selection = copy.deepcopy(phase_profile.get("ncu_iteration_selection", {}))
+            sampled_iterations = sorted(iteration_reports.keys())
+            representative_iteration = iteration_selection.get("representative_iteration")
+            if representative_iteration is None:
+                representative_iteration = phase_profile.get("ncu_representative_iteration")
+
+            selected_iteration = int(args.iteration) if args.iteration is not None else representative_iteration
+            if selected_iteration is None:
+                fail(
+                    "No representative decode steady-state iteration is registered. "
+                    "Rerun the decode NCU profiling step."
+                )
+            if selected_iteration not in iteration_reports:
+                fail(
+                    f"Decode steady-state NCU report for iteration {selected_iteration} is not registered. "
+                    f"Available iterations: {', '.join(str(value) for value in sampled_iterations) or 'none'}"
+                )
+
+            report_path = iteration_reports[selected_iteration]
+            steady_state_context = {
+                "ncu_mode": DECODE_STEADY_STATE_MODE,
+                "sampled_iterations": sampled_iterations,
+                "representative_iteration": representative_iteration,
+                "selected_iteration": selected_iteration,
+                "summary_json": phase_profile.get("ncu_steady_state_summary_json"),
+            }
+        else:
+            if args.iteration is not None:
+                fail(
+                    "--iteration is only supported for registered decode steady-state NCU profiles "
+                    "or with an explicit --report."
+                )
+            if isinstance(phase_profile, dict) and phase_profile.get("ncu_rep"):
+                report_path = Path(str(phase_profile["ncu_rep"])).resolve()
 
     if report_path is None:
         if args.phase:
@@ -911,18 +1093,26 @@ def inspect_ncu_command(args: argparse.Namespace) -> int:
             )
 
         if args.format == "json":
-            print(
-                json.dumps(
-                    {
-                        "report_path": str(report_path),
-                        "cache_path": str(ncu_slice_cache_path(report_path)),
-                        "summary": summary,
-                    },
-                    indent=2,
-                )
-            )
+            payload = {
+                "report_path": str(report_path),
+                "cache_path": str(ncu_slice_cache_path(report_path)),
+                "summary": summary,
+            }
+            if steady_state_context is not None:
+                payload.update(steady_state_context)
+            print(json.dumps(payload, indent=2))
             return 0
 
+        if steady_state_context is not None:
+            print(f"ncu_mode: {steady_state_context['ncu_mode']}")
+            print(
+                "sampled iterations: "
+                + ", ".join(str(value) for value in steady_state_context["sampled_iterations"])
+            )
+            print(f"representative iteration: {steady_state_context['representative_iteration']}")
+            print(f"selected iteration: {steady_state_context['selected_iteration']}")
+            print(f"steady-state summary: {steady_state_context.get('summary_json', '-')}")
+            print("")
         print(f"report: {report_path}")
         print(f"cache:  {ncu_slice_cache_path(report_path)}")
         print(f"launches: {summary.get('kernel_id_count', 0)}")
@@ -2185,6 +2375,10 @@ def execute_inference_run(
             bool(metadata.get("output_exists")),
         )
     )
+    if phase == "decode":
+        selection = select_decode_steady_state_iterations(metadata.get("actual_output_token_count"))
+        if selection:
+            metadata["decode_steady_state_iteration_selection"] = selection
     return metadata
 
 
@@ -2975,6 +3169,19 @@ def summarize_nsys_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def clear_decode_steady_state_fields(phase_profile: Dict[str, Any]) -> None:
+    for key in (
+        "ncu_iteration_selection",
+        "ncu_iteration_reports",
+        "ncu_iteration_metadata_jsons",
+        "ncu_iteration_runtime_profile_jsons",
+        "ncu_iteration_summaries",
+        "ncu_representative_iteration",
+        "ncu_steady_state_summary_json",
+    ):
+        phase_profile.pop(key, None)
+
+
 def register_ncu_command(args: argparse.Namespace) -> int:
     config = load_run_config()
     profiles = config.setdefault("profiles", {})
@@ -3014,6 +3221,7 @@ def register_ncu_command(args: argparse.Namespace) -> int:
             metadata_payload["runtime_profile_json"] = str(runtime_profile_path)
         write_json(metadata_path, metadata_payload)
 
+    phase_profile["ncu_mode"] = SINGLE_REPORT_NCU_MODE
     phase_profile["ncu_rep"] = str(report_path)
     phase_profile["ncu_registered_at"] = registered_at
     phase_profile["ncu_collection_backend"] = args.collection_backend
@@ -3027,8 +3235,250 @@ def register_ncu_command(args: argparse.Namespace) -> int:
         phase_profile["ncu_metadata_json"] = str(metadata_path)
     if runtime_profile_path is not None:
         phase_profile["ncu_runtime_profile_json"] = str(runtime_profile_path)
+    if args.phase == "decode":
+        clear_decode_steady_state_fields(phase_profile)
 
     save_run_config(config)
+    return 0
+
+
+def build_decode_steady_state_summary(
+    *,
+    phase_workload: Dict[str, Any],
+    selection_metadata_path: Path,
+    selection_metadata: Dict[str, Any],
+    collection_backend: str,
+    replay_mode: str,
+    collection_profile: str,
+    iteration_selection: Dict[str, Any],
+    iteration_reports: Dict[int, Path],
+    iteration_metadata_paths: Dict[int, Path],
+    iteration_runtime_profile_paths: Dict[int, Path],
+    registered_at: str,
+) -> Dict[str, Any]:
+    selected_iterations = [int(value) for value in iteration_selection.get("iterations", [])]
+    representative_iteration = iteration_selection.get("representative_iteration")
+    representative_key = str(representative_iteration) if representative_iteration is not None else None
+
+    per_iteration: Dict[str, Any] = {}
+    comparison_rows: List[Dict[str, Any]] = []
+    total_gpu_time_values: List[float] = []
+
+    for iteration in selected_iterations:
+        iteration_key = str(iteration)
+        report_path = iteration_reports[iteration]
+        metadata_path = iteration_metadata_paths.get(iteration)
+        runtime_profile_path = iteration_runtime_profile_paths.get(iteration)
+        metadata_payload = read_json(metadata_path) if metadata_path and metadata_path.exists() else {}
+        slice_cache = load_ncu_slice_cache(report_path)
+        slice_summary = copy.deepcopy(slice_cache.get("summary", {}))
+        ncu_summary = summarize_ncu_report(report_path)
+
+        total_gpu_time_ms = float(ncu_summary.get("total_gpu_time_ns", 0)) / 1_000_000.0
+        total_gpu_time_values.append(total_gpu_time_ms)
+        comparison_rows.append(
+            {
+                "iteration": iteration,
+                "report_path": str(report_path),
+                "phase_filter": decode_iteration_phase_filter(iteration),
+                "kernel_id_count": int(ncu_summary.get("kernel_id_count", 0)),
+                "total_gpu_time_ms": total_gpu_time_ms,
+                "gemm_kernel_ids": int(ncu_summary.get("family_counts", {}).get("gemm_like", 0)),
+                "attention_kernel_ids": int(
+                    ncu_summary.get("family_counts", {}).get("attention_like", 0)
+                ),
+            }
+        )
+
+        per_iteration[iteration_key] = {
+            "iteration": iteration,
+            "range_name": decode_iteration_range_name(iteration),
+            "phase_filter": decode_iteration_phase_filter(iteration),
+            "report_path": str(report_path),
+            "metadata_json": str(metadata_path) if metadata_path else None,
+            "runtime_profile_json": str(runtime_profile_path) if runtime_profile_path else None,
+            "actual_output_token_count": metadata_payload.get("actual_output_token_count"),
+            "ncu_summary": ncu_summary,
+            "slice_summary": slice_summary,
+            "top_kernels": top_ncu_kernel_rows(slice_cache.get("kernels", []), limit=10),
+            "top_gemm_kernels": top_ncu_kernel_rows(
+                slice_cache.get("kernels", []),
+                family="gemm_like",
+                limit=10,
+            ),
+        }
+
+    representative_gemm_kernels = []
+    if representative_key is not None and representative_key in per_iteration:
+        representative_gemm_kernels = copy.deepcopy(
+            per_iteration[representative_key].get("top_gemm_kernels", [])
+        )
+
+    return {
+        "phase": "decode",
+        "ncu_mode": DECODE_STEADY_STATE_MODE,
+        "workflow_backend": WORKFLOW_BACKEND,
+        "workflow_id": WORKFLOW_ID,
+        "registered_at": registered_at,
+        "selection_metadata_json": str(selection_metadata_path),
+        "phase_workload": copy.deepcopy(phase_workload),
+        "collection_backend": collection_backend,
+        "replay_mode": replay_mode,
+        "collection_profile": collection_profile,
+        "iteration_selection": copy.deepcopy(iteration_selection),
+        "representative_iteration": representative_iteration,
+        "requested_max_generate_length": selection_metadata.get("requested_max_generate_length"),
+        "actual_output_token_count": selection_metadata.get("actual_output_token_count"),
+        "iteration_comparison": comparison_rows,
+        "iteration_total_gpu_time_ms": numeric_series_stats(total_gpu_time_values),
+        "per_iteration": per_iteration,
+        "representative_gemm_kernels": representative_gemm_kernels,
+    }
+
+
+def register_decode_steady_state_ncu_command(args: argparse.Namespace) -> int:
+    config = load_run_config()
+    profiles = config.setdefault("profiles", {})
+    phase_profile = profiles.setdefault("decode", {})
+
+    selection_metadata_path = Path(args.selection_metadata).resolve()
+    summary_output_path = Path(args.summary_output).resolve()
+    if not selection_metadata_path.exists():
+        fail(f"Decode steady-state selection metadata was not found: {selection_metadata_path}")
+
+    selection_metadata = read_json(selection_metadata_path)
+    iteration_selection = decode_iteration_selection_from_metadata(selection_metadata)
+    selected_iterations = [int(value) for value in iteration_selection.get("iterations", [])]
+    representative_iteration = iteration_selection.get("representative_iteration")
+    if not selected_iterations:
+        fail(
+            "Decode steady-state selection metadata did not resolve any decode iterations. "
+            "Rerun the decode probe with a workload that produces decode iterations."
+        )
+    if representative_iteration is None:
+        fail("Decode steady-state selection metadata did not include a representative iteration.")
+
+    iteration_reports = parse_iteration_path_specs(args.iteration_report, "--iteration-report")
+    iteration_metadata_paths = parse_iteration_path_specs(
+        args.iteration_metadata,
+        "--iteration-metadata",
+    )
+    iteration_runtime_profile_paths = parse_iteration_path_specs(
+        args.iteration_runtime_profile,
+        "--iteration-runtime-profile",
+    )
+
+    missing_reports = [iteration for iteration in selected_iterations if iteration not in iteration_reports]
+    if missing_reports:
+        fail(
+            "Missing decode steady-state Nsight Compute report paths for iterations: "
+            + ", ".join(str(iteration) for iteration in missing_reports)
+        )
+    if representative_iteration not in iteration_reports:
+        fail(
+            f"Representative decode iteration {representative_iteration} does not have a registered report path."
+        )
+
+    registered_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    representative_metadata_json = None
+    representative_runtime_profile_json = None
+    representative_summary = None
+    representative_requested_max_generate_length = selection_metadata.get("requested_max_generate_length")
+
+    for iteration in selected_iterations:
+        report_path = iteration_reports[iteration]
+        if not report_path.exists():
+            fail(f"Nsight Compute report was not found: {report_path}")
+
+        metadata_path = iteration_metadata_paths.get(iteration)
+        runtime_profile_path = iteration_runtime_profile_paths.get(iteration)
+        metadata_payload = read_json(metadata_path) if metadata_path and metadata_path.exists() else {}
+        requested_max_new_tokens = metadata_payload.get("requested_max_generate_length")
+        if requested_max_new_tokens is None:
+            requested_max_new_tokens = selection_metadata.get("requested_max_generate_length")
+        if requested_max_new_tokens is None:
+            requested_max_new_tokens = config["phase_workloads"]["decode"].get("max_generate_length")
+
+        ncu_summary = summarize_ncu_report(report_path)
+
+        if metadata_path:
+            metadata_payload["collection_backend"] = args.collection_backend
+            metadata_payload["replay_mode"] = args.replay_mode
+            metadata_payload["collection_profile"] = args.collection_profile
+            metadata_payload["phase_filter"] = decode_iteration_phase_filter(iteration)
+            metadata_payload["requested_max_generate_length"] = requested_max_new_tokens
+            metadata_payload["actual_output_token_count"] = metadata_payload.get(
+                "actual_output_token_count",
+                selection_metadata.get("actual_output_token_count"),
+            )
+            metadata_payload["report_created_at"] = registered_at
+            metadata_payload["ncu_iteration"] = iteration
+            metadata_payload["ncu_range_name"] = decode_iteration_range_name(iteration)
+            metadata_payload["ncu_summary"] = ncu_summary
+            metadata_payload["decode_steady_state_iteration_selection"] = copy.deepcopy(iteration_selection)
+            if runtime_profile_path is not None:
+                metadata_payload["runtime_profile_json"] = str(runtime_profile_path)
+            write_json(metadata_path, metadata_payload)
+
+        if iteration == representative_iteration:
+            representative_summary = ncu_summary
+            if metadata_path is not None:
+                representative_metadata_json = str(metadata_path)
+            if runtime_profile_path is not None:
+                representative_runtime_profile_json = str(runtime_profile_path)
+            representative_requested_max_generate_length = requested_max_new_tokens
+
+    steady_state_summary = build_decode_steady_state_summary(
+        phase_workload=copy.deepcopy(config["phase_workloads"]["decode"]),
+        selection_metadata_path=selection_metadata_path,
+        selection_metadata=selection_metadata,
+        collection_backend=args.collection_backend,
+        replay_mode=args.replay_mode,
+        collection_profile=args.collection_profile,
+        iteration_selection=iteration_selection,
+        iteration_reports=iteration_reports,
+        iteration_metadata_paths=iteration_metadata_paths,
+        iteration_runtime_profile_paths=iteration_runtime_profile_paths,
+        registered_at=registered_at,
+    )
+    write_json(summary_output_path, steady_state_summary)
+
+    clear_decode_steady_state_fields(phase_profile)
+    phase_profile["ncu_mode"] = DECODE_STEADY_STATE_MODE
+    phase_profile["ncu_rep"] = str(iteration_reports[representative_iteration])
+    phase_profile["ncu_registered_at"] = registered_at
+    phase_profile["ncu_collection_backend"] = args.collection_backend
+    phase_profile["ncu_replay_mode"] = args.replay_mode
+    phase_profile["ncu_collection_profile"] = args.collection_profile
+    phase_profile["ncu_phase_filter"] = decode_iteration_phase_filter(representative_iteration)
+    phase_profile["ncu_requested_max_generate_length"] = representative_requested_max_generate_length
+    phase_profile["ncu_actual_output_token_count"] = selection_metadata.get("actual_output_token_count")
+    phase_profile["ncu_summary"] = representative_summary or {}
+    phase_profile["ncu_representative_iteration"] = representative_iteration
+    phase_profile["ncu_iteration_selection"] = copy.deepcopy(iteration_selection)
+    phase_profile["ncu_iteration_reports"] = {
+        str(iteration): str(path)
+        for iteration, path in sorted(iteration_reports.items())
+    }
+    phase_profile["ncu_iteration_metadata_jsons"] = {
+        str(iteration): str(path)
+        for iteration, path in sorted(iteration_metadata_paths.items())
+        if path
+    }
+    phase_profile["ncu_iteration_runtime_profile_jsons"] = {
+        str(iteration): str(path)
+        for iteration, path in sorted(iteration_runtime_profile_paths.items())
+        if path
+    }
+    phase_profile["ncu_iteration_summaries"] = copy.deepcopy(
+        steady_state_summary.get("per_iteration", {})
+    )
+    phase_profile["ncu_steady_state_summary_json"] = str(summary_output_path)
+    phase_profile["ncu_metadata_json"] = representative_metadata_json
+    phase_profile["ncu_runtime_profile_json"] = representative_runtime_profile_json
+
+    save_run_config(config)
+    log(f"Saved decode steady-state NCU summary to {summary_output_path}")
     return 0
 
 
@@ -3103,15 +3553,34 @@ def report_config_command(args: argparse.Namespace) -> int:
         phase_profile = profiles.get(phase, {})
         if not phase_profile:
             continue
+        ncu_mode = phase_profile.get("ncu_mode", "-")
         lines.extend(
             [
                 "",
                 f"{phase.title()} artifacts:",
                 f"  nsys_rep: {phase_profile.get('nsys_rep', '-')}",
+                f"  ncu_mode: {ncu_mode}",
                 f"  ncu_rep: {phase_profile.get('ncu_rep', '-')}",
                 f"  ncu_metadata_json: {phase_profile.get('ncu_metadata_json', '-')}",
             ]
         )
+        if phase == "decode" and ncu_mode == DECODE_STEADY_STATE_MODE:
+            iteration_selection = phase_profile.get("ncu_iteration_selection", {})
+            sampled_iterations = iteration_selection.get("iterations", [])
+            lines.extend(
+                [
+                    f"  ncu_representative_iteration: {phase_profile.get('ncu_representative_iteration', '-')}",
+                    "  ncu_sampled_iterations: "
+                    + (", ".join(str(value) for value in sampled_iterations) if sampled_iterations else "-"),
+                    f"  ncu_steady_state_summary_json: {phase_profile.get('ncu_steady_state_summary_json', '-')}",
+                ]
+            )
+            iteration_reports = phase_profile.get("ncu_iteration_reports", {})
+            if isinstance(iteration_reports, dict):
+                for iteration_key in sorted(iteration_reports, key=lambda value: int(value)):
+                    lines.append(
+                        f"  ncu_iteration_report[{iteration_key}]: {iteration_reports.get(iteration_key, '-')}"
+                    )
         ncu_summary = phase_profile.get("ncu_summary")
         if isinstance(ncu_summary, dict):
             lines.extend(
@@ -3238,12 +3707,41 @@ def build_parser() -> argparse.ArgumentParser:
     register_ncu.add_argument("--phase-filter", default=None)
     register_ncu.add_argument("--runtime-profile", default=None)
 
+    register_decode_steady_state_ncu = subparsers.add_parser(
+        "register-decode-steady-state-ncu",
+        help="Record steady-state decode iteration .ncu-rep artifacts and a cross-iteration summary.",
+    )
+    register_decode_steady_state_ncu.add_argument("--selection-metadata", required=True)
+    register_decode_steady_state_ncu.add_argument(
+        "--iteration-report",
+        action="append",
+        default=[],
+        help="ITERATION=PATH entry for a decode steady-state .ncu-rep file.",
+    )
+    register_decode_steady_state_ncu.add_argument(
+        "--iteration-metadata",
+        action="append",
+        default=[],
+        help="ITERATION=PATH entry for a decode steady-state run metadata JSON file.",
+    )
+    register_decode_steady_state_ncu.add_argument(
+        "--iteration-runtime-profile",
+        action="append",
+        default=[],
+        help="ITERATION=PATH entry for a decode steady-state runtime profile JSON file.",
+    )
+    register_decode_steady_state_ncu.add_argument("--summary-output", required=True)
+    register_decode_steady_state_ncu.add_argument("--collection-backend", required=True)
+    register_decode_steady_state_ncu.add_argument("--replay-mode", required=True)
+    register_decode_steady_state_ncu.add_argument("--collection-profile", required=True)
+
     inspect_ncu = subparsers.add_parser(
         "inspect-ncu",
         help="Query an .ncu-rep report through a cache-backed CLI instead of the GUI.",
     )
     inspect_ncu.add_argument("--report", default=None)
     inspect_ncu.add_argument("--phase", choices=["prefill", "decode"], default=None)
+    inspect_ncu.add_argument("--iteration", type=int, default=None)
     inspect_ncu.add_argument(
         "--view",
         choices=["summary", "kernels", "launches"],
@@ -3297,6 +3795,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return summarize_nsys_command(args)
         if args.command == "register-ncu":
             return register_ncu_command(args)
+        if args.command == "register-decode-steady-state-ncu":
+            return register_decode_steady_state_ncu_command(args)
         if args.command == "inspect-ncu":
             return inspect_ncu_command(args)
         if args.command == "report-config":

@@ -11,8 +11,8 @@ if [[ $# -eq 0 ]]; then
   cat <<'EOF'
 Usage:
   bash 13_target_inspect_ncu.sh --phase decode
-  bash 13_target_inspect_ncu.sh --phase decode --view kernels --family gemm_like --limit 15
-  bash 13_target_inspect_ncu.sh --report artifacts/reports/decode.ncu-rep --view launches --sort dram_pct --limit 20
+  bash 13_target_inspect_ncu.sh --phase decode --iteration 64 --view kernels --family gemm_like --limit 15
+  bash 13_target_inspect_ncu.sh --report artifacts/reports/decode_iter064.ncu-rep --view launches --sort mem_pct --limit 20
 
 Notes:
   - The first query for a report builds a JSON cache beside the .ncu-rep file.
