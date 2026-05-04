@@ -231,6 +231,76 @@ def deep_merge_in_place(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[s
     return base
 
 
+def current_artifacts_config() -> Dict[str, str]:
+    return {
+        "artifacts_dir": str(ARTIFACTS_DIR),
+        "cache_dir": str(CACHE_DIR),
+        "export_dir": str(EXPORT_DIR),
+        "export_bundle_dir": str(EXPORT_BUNDLE_DIR),
+        "runtime_dir": str(RUNTIME_DIR),
+        "inputs_dir": str(INPUTS_DIR),
+        "reports_dir": str(REPORTS_DIR),
+        "run_config_json": str(RUN_CONFIG_PATH),
+    }
+
+
+def infer_repo_root_from_config(config: Dict[str, Any]) -> Optional[Path]:
+    artifacts = config.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return None
+
+    for key in ("artifacts_dir", "run_config_json"):
+        value = artifacts.get(key)
+        if not value:
+            continue
+        path = Path(str(value)).expanduser()
+        if key == "artifacts_dir" and path.name == "artifacts":
+            return path.parent
+        if key == "run_config_json" and path.name == "run_config.json":
+            return path.parent.parent
+    return None
+
+
+def find_repo_root_candidates(payload: Any) -> List[str]:
+    candidates: set[str] = set()
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            for value in node.values():
+                visit(value)
+            return
+        if isinstance(node, list):
+            for value in node:
+                visit(value)
+            return
+        if not isinstance(node, str):
+            return
+
+        for marker in (f"{os.sep}artifacts{os.sep}", f"{os.sep}.venv{os.sep}"):
+            marker_index = node.find(marker)
+            if marker_index > 0:
+                candidates.add(node[:marker_index])
+
+    visit(payload)
+    return sorted(candidates, key=len, reverse=True)
+
+
+def rewrite_repo_root_refs(payload: Any, old_root: str, new_root: str) -> Any:
+    if isinstance(payload, dict):
+        return {
+            key: rewrite_repo_root_refs(value, old_root, new_root)
+            for key, value in payload.items()
+        }
+    if isinstance(payload, list):
+        return [rewrite_repo_root_refs(value, old_root, new_root) for value in payload]
+    if isinstance(payload, str):
+        if payload == old_root:
+            return new_root
+        if payload.startswith(old_root + os.sep):
+            return new_root + payload[len(old_root) :]
+    return payload
+
+
 def default_run_config() -> Dict[str, Any]:
     return {
         "workflow_backend": WORKFLOW_BACKEND,
@@ -242,16 +312,7 @@ def default_run_config() -> Dict[str, Any]:
         },
         "phase_workloads": copy.deepcopy(PHASE_WORKLOAD_DEFAULTS),
         "engine_build_config": copy.deepcopy(ENGINE_BUILD_DEFAULTS),
-        "artifacts": {
-            "artifacts_dir": str(ARTIFACTS_DIR),
-            "cache_dir": str(CACHE_DIR),
-            "export_dir": str(EXPORT_DIR),
-            "export_bundle_dir": str(EXPORT_BUNDLE_DIR),
-            "runtime_dir": str(RUNTIME_DIR),
-            "inputs_dir": str(INPUTS_DIR),
-            "reports_dir": str(REPORTS_DIR),
-            "run_config_json": str(RUN_CONFIG_PATH),
-        },
+        "artifacts": current_artifacts_config(),
         "edge_llm": {
             "repo_root": str(default_edge_llm_repo_root()),
         },
@@ -298,6 +359,10 @@ def load_run_config() -> Dict[str, Any]:
     ensure_dirs()
     existing = read_json(RUN_CONFIG_PATH)
     base = default_run_config()
+    repo_root_candidates = set(find_repo_root_candidates(existing))
+    inferred_repo_root = infer_repo_root_from_config(existing)
+    if inferred_repo_root is not None:
+        repo_root_candidates.add(str(inferred_repo_root))
 
     if stale_workflow_state(existing):
         preserved_workload = existing.get("workload") if isinstance(existing.get("workload"), dict) else {}
@@ -328,6 +393,13 @@ def load_run_config() -> Dict[str, Any]:
         config = copy.deepcopy(base)
         deep_merge_in_place(config, existing)
 
+    for repo_root in sorted(repo_root_candidates, key=len, reverse=True):
+        if repo_root != str(ROOT_DIR):
+            config = rewrite_repo_root_refs(config, repo_root, str(ROOT_DIR))
+
+    # Artifact paths are derived from the current repo root and should not
+    # persist historical absolute paths from an older checkout location.
+    config["artifacts"] = current_artifacts_config()
     config["workflow_backend"] = WORKFLOW_BACKEND
     config["workflow_id"] = WORKFLOW_ID
     config["requested_model_id"] = REQUESTED_MODEL_ID
@@ -341,6 +413,7 @@ def load_run_config() -> Dict[str, Any]:
 
 
 def save_run_config(config: Dict[str, Any]) -> None:
+    config["artifacts"] = current_artifacts_config()
     config["workflow_backend"] = WORKFLOW_BACKEND
     config["workflow_id"] = WORKFLOW_ID
     config["requested_model_id"] = REQUESTED_MODEL_ID
