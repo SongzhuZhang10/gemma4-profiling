@@ -47,6 +47,11 @@ for iteration in iterations:
 PY
 )
 
+if [[ "${#decode_iterations[@]}" -eq 0 ]]; then
+  workflow_log "Decode probe did not resolve any steady-state iterations."
+  exit 1
+fi
+
 representative_iteration="$("$PYTHON_BIN" - "$decode_probe_metadata_json" <<'PY'
 import json
 import pathlib
@@ -61,11 +66,6 @@ if representative_iteration is None:
 print(int(representative_iteration))
 PY
 )"
-
-if [[ "${#decode_iterations[@]}" -eq 0 ]]; then
-  workflow_log "Decode probe did not resolve any steady-state iterations."
-  exit 1
-fi
 
 iteration_report_args=()
 iteration_metadata_args=()
