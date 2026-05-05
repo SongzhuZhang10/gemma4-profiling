@@ -52,8 +52,12 @@ launcher_path.chmod(0o755)
 PY
 
 workflow_log "Capturing Nsight Systems timeline for the prefill workload."
+# The useful application-owned phase ranges are emitted in the default NVTX
+# domain. Restricting NVTX tracing to that domain drops the non-default
+# TensorRT/myelin NVTX domains while phase scoping still comes from LLM_PREFILL.
 nsys profile \
-  --trace=cuda,nvtx,osrt \
+  --trace=cuda,nvtx \
+  --nvtx-domain-include default \
   --cuda-graph-trace=node \
   --sample=none \
   --force-overwrite=true \

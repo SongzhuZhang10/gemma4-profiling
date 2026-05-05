@@ -165,8 +165,9 @@ PY
   workflow_log \
     "Capturing Nsight Compute profile for steady-state decode iteration ${iteration} " \
     "(launch-skip=${decode_launch_skip}, launch-count=${decode_launch_count})."
-  # The per-iteration NVTX subranges do not match Nsight Compute's kernel-context filters reliably
-  # with this runtime, so we select the steady-state iteration by launch window inside LLM_GENERATION.
+  # Nsight Systems shows per-iteration Decode_Iter[...] ranges, but Nsight
+  # Compute selection remains anchored on the stable outer LLM_GENERATION range
+  # plus launch-skip/launch-count because the subranges do not filter reliably.
   ncu \
     --target-processes all \
     --nvtx \

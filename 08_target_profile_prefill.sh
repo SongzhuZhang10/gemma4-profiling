@@ -15,6 +15,8 @@ prefill_runtime_profile_json="$REPORTS_DIR/prefill_ncu_runtime_profile.json"
 rm -f "$prefill_ncu_report" "$prefill_metadata_json" "$prefill_runtime_profile_json"
 
 workflow_log "Capturing Nsight Compute profile for the prefill workload."
+# LLM_PREFILL is the confirmed stable outer prefill range in the current
+# TensorRT-Edge-LLM C++ binary.
 ncu \
   --target-processes all \
   --nvtx \
