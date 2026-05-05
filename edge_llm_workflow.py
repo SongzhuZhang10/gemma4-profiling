@@ -110,13 +110,15 @@ NCU_MEMORY_THROUGHPUT_METRIC = (
 NCU_LEGACY_MEMORY_THROUGHPUT_METRIC = (
     "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed"
 )
-NCU_SLICE_CACHE_VERSION = 3
+NCU_OCCUPANCY_METRIC = "sm__warps_active.avg.pct_of_peak_sustained_active"
+NCU_SLICE_CACHE_VERSION = 4
 
 NCU_SLICE_METRICS = ",".join(
     (
         "gpu__time_duration.sum",
         "sm__throughput.avg.pct_of_peak_sustained_elapsed",
         NCU_MEMORY_THROUGHPUT_METRIC,
+        NCU_OCCUPANCY_METRIC,
     )
 )
 
@@ -130,7 +132,7 @@ NCU_METRIC_ALIASES = {
     "Compute Memory Pipeline Throughput": "mem_pct",
     "Compute Memory Throughput": "mem_pct",
     "DRAM Throughput": "mem_pct",
-    "sm__warps_active.avg.pct_of_peak_sustained_active": "warps_pct",
+    NCU_OCCUPANCY_METRIC: "warps_pct",
     "Achieved Occupancy": "warps_pct",
 }
 
@@ -528,8 +530,57 @@ def decode_iteration_range_name(iteration: int) -> str:
     return f"DECODE_ITER_{int(iteration):03d}"
 
 
-def decode_iteration_phase_filter(iteration: int) -> str:
-    return f"LLM_GENERATION/{decode_iteration_range_name(iteration)}/"
+def escape_ncu_nvtx_name(value: str) -> str:
+    escaped: List[str] = []
+    for char in str(value):
+        if char == "\\" or char in "@,[]/*+":
+            escaped.append("\\")
+        escaped.append(char)
+    return "".join(escaped)
+
+
+def decode_iteration_display_name(
+    iteration: int,
+    total_output_token_count: int,
+    *,
+    active_batch_size: int = 1,
+) -> str:
+    return (
+        f"Decode_Iter[{int(iteration)}/{int(total_output_token_count)},"
+        f"Active={int(active_batch_size)}]"
+    )
+
+
+def decode_iteration_phase_filter(
+    iteration: int,
+    total_output_token_count: Optional[Any],
+) -> str:
+    try:
+        normalized_total = int(total_output_token_count)
+    except (TypeError, ValueError):
+        normalized_total = 0
+
+    if normalized_total <= 0:
+        return escape_ncu_nvtx_name(decode_iteration_range_name(iteration))
+
+    return escape_ncu_nvtx_name(
+        decode_iteration_display_name(iteration, normalized_total)
+    )
+
+
+def decode_iteration_phase_filter_from_selection(
+    iteration_selection: Dict[str, Any],
+    iteration: int,
+    *,
+    actual_output_token_count: Optional[Any] = None,
+) -> str:
+    selection_filters = iteration_selection.get("iteration_phase_filters", {})
+    if isinstance(selection_filters, dict):
+        selected_filter = selection_filters.get(str(iteration))
+        if selected_filter:
+            return str(selected_filter)
+
+    return decode_iteration_phase_filter(iteration, actual_output_token_count)
 
 
 def decode_loop_count_from_output_tokens(actual_output_token_count: Optional[Any]) -> Optional[int]:
@@ -566,9 +617,10 @@ def select_decode_steady_state_iterations(
         if iterations
         else None
     )
+    normalized_output_token_count = int(actual_output_token_count)
 
     iteration_phase_filters = {
-        str(iteration): decode_iteration_phase_filter(iteration)
+        str(iteration): decode_iteration_phase_filter(iteration, normalized_output_token_count)
         for iteration in iterations
     }
     iteration_range_names = {
@@ -3270,6 +3322,14 @@ def build_decode_steady_state_summary(
         metadata_path = iteration_metadata_paths.get(iteration)
         runtime_profile_path = iteration_runtime_profile_paths.get(iteration)
         metadata_payload = read_json(metadata_path) if metadata_path and metadata_path.exists() else {}
+        iteration_phase_filter = str(
+            metadata_payload.get("phase_filter")
+            or decode_iteration_phase_filter_from_selection(
+                iteration_selection,
+                iteration,
+                actual_output_token_count=selection_metadata.get("actual_output_token_count"),
+            )
+        )
         slice_cache = load_ncu_slice_cache(report_path)
         slice_summary = copy.deepcopy(slice_cache.get("summary", {}))
         ncu_summary = summarize_ncu_report(report_path)
@@ -3280,7 +3340,9 @@ def build_decode_steady_state_summary(
             {
                 "iteration": iteration,
                 "report_path": str(report_path),
-                "phase_filter": decode_iteration_phase_filter(iteration),
+                "phase_filter": iteration_phase_filter,
+                "launch_skip": metadata_payload.get("ncu_launch_skip"),
+                "launch_count": metadata_payload.get("ncu_launch_count"),
                 "kernel_id_count": int(ncu_summary.get("kernel_id_count", 0)),
                 "total_gpu_time_ms": total_gpu_time_ms,
                 "gemm_kernel_ids": int(ncu_summary.get("family_counts", {}).get("gemm_like", 0)),
@@ -3293,7 +3355,10 @@ def build_decode_steady_state_summary(
         per_iteration[iteration_key] = {
             "iteration": iteration,
             "range_name": decode_iteration_range_name(iteration),
-            "phase_filter": decode_iteration_phase_filter(iteration),
+            "phase_filter": iteration_phase_filter,
+            "launch_skip": metadata_payload.get("ncu_launch_skip"),
+            "launch_count": metadata_payload.get("ncu_launch_count"),
+            "selection_strategy": metadata_payload.get("ncu_selection_strategy"),
             "report_path": str(report_path),
             "metadata_json": str(metadata_path) if metadata_path else None,
             "runtime_profile_json": str(runtime_profile_path) if runtime_profile_path else None,
@@ -3384,6 +3449,11 @@ def register_decode_steady_state_ncu_command(args: argparse.Namespace) -> int:
     representative_runtime_profile_json = None
     representative_summary = None
     representative_requested_max_generate_length = selection_metadata.get("requested_max_generate_length")
+    representative_phase_filter = decode_iteration_phase_filter_from_selection(
+        iteration_selection,
+        representative_iteration,
+        actual_output_token_count=selection_metadata.get("actual_output_token_count"),
+    )
 
     for iteration in selected_iterations:
         report_path = iteration_reports[iteration]
@@ -3393,6 +3463,14 @@ def register_decode_steady_state_ncu_command(args: argparse.Namespace) -> int:
         metadata_path = iteration_metadata_paths.get(iteration)
         runtime_profile_path = iteration_runtime_profile_paths.get(iteration)
         metadata_payload = read_json(metadata_path) if metadata_path and metadata_path.exists() else {}
+        iteration_phase_filter = str(
+            metadata_payload.get("phase_filter")
+            or decode_iteration_phase_filter_from_selection(
+                iteration_selection,
+                iteration,
+                actual_output_token_count=selection_metadata.get("actual_output_token_count"),
+            )
+        )
         requested_max_new_tokens = metadata_payload.get("requested_max_generate_length")
         if requested_max_new_tokens is None:
             requested_max_new_tokens = selection_metadata.get("requested_max_generate_length")
@@ -3405,7 +3483,7 @@ def register_decode_steady_state_ncu_command(args: argparse.Namespace) -> int:
             metadata_payload["collection_backend"] = args.collection_backend
             metadata_payload["replay_mode"] = args.replay_mode
             metadata_payload["collection_profile"] = args.collection_profile
-            metadata_payload["phase_filter"] = decode_iteration_phase_filter(iteration)
+            metadata_payload["phase_filter"] = iteration_phase_filter
             metadata_payload["requested_max_generate_length"] = requested_max_new_tokens
             metadata_payload["actual_output_token_count"] = metadata_payload.get(
                 "actual_output_token_count",
@@ -3422,6 +3500,7 @@ def register_decode_steady_state_ncu_command(args: argparse.Namespace) -> int:
 
         if iteration == representative_iteration:
             representative_summary = ncu_summary
+            representative_phase_filter = iteration_phase_filter
             if metadata_path is not None:
                 representative_metadata_json = str(metadata_path)
             if runtime_profile_path is not None:
@@ -3450,7 +3529,7 @@ def register_decode_steady_state_ncu_command(args: argparse.Namespace) -> int:
     phase_profile["ncu_collection_backend"] = args.collection_backend
     phase_profile["ncu_replay_mode"] = args.replay_mode
     phase_profile["ncu_collection_profile"] = args.collection_profile
-    phase_profile["ncu_phase_filter"] = decode_iteration_phase_filter(representative_iteration)
+    phase_profile["ncu_phase_filter"] = representative_phase_filter
     phase_profile["ncu_requested_max_generate_length"] = representative_requested_max_generate_length
     phase_profile["ncu_actual_output_token_count"] = selection_metadata.get("actual_output_token_count")
     phase_profile["ncu_summary"] = representative_summary or {}
