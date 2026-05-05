@@ -7,8 +7,6 @@ source "$(cd "$(dirname "$0")" && pwd)/edge_llm_env.sh"
 require_python_env
 ensure_workflow_dirs
 
-readonly PREFILL_NCU_MINIMAL_METRICS="gpu__time_duration.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed,gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"
-
 prefill_ncu_stem="$REPORTS_DIR/prefill"
 prefill_ncu_report="$REPORTS_DIR/prefill.ncu-rep"
 prefill_metadata_json="$REPORTS_DIR/prefill_ncu_run_metadata.json"
@@ -23,7 +21,7 @@ ncu \
   --nvtx-include "LLM_PREFILL/" \
   --replay-mode kernel \
   --clock-control none \
-  --metrics "$PREFILL_NCU_MINIMAL_METRICS" \
+  --set basic \
   --disable-extra-suffixes \
   --force-overwrite \
   -o "$prefill_ncu_stem" \
@@ -44,7 +42,7 @@ fi
   --metadata "$prefill_metadata_json" \
   --collection-backend tensorrt_edge_llm \
   --replay-mode kernel \
-  --collection-profile minimal \
+  --collection-profile basic \
   --phase-filter LLM_PREFILL/ \
   --runtime-profile "$prefill_runtime_profile_json" \
   --requested-max-new-tokens 1
